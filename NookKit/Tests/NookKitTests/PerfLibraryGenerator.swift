@@ -33,58 +33,22 @@ struct PerfLibraryGenerator {
         if FileManager.default.fileExists(atPath: outputURL.path(percentEncoded: false)) {
             try FileManager.default.removeItem(at: outputURL)
         }
+        // Feed XML is per library: lib-20k's feed-big must not leak into a
+        // lib-10k refresh. run.sh serves feeds/<lib>/<variant>.
         let feedsRoot = outputURL.deletingLastPathComponent().deletingLastPathComponent()
             .appending(path: "feeds", directoryHint: .isDirectory)
+            .appending(path: outputURL.lastPathComponent, directoryHint: .isDirectory)
+        if FileManager.default.fileExists(atPath: feedsRoot.path(percentEncoded: false)) {
+            try FileManager.default.removeItem(at: feedsRoot)
+        }
         try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
 
         var rng = SplitMix64(seed: 42)
-        let folders = (1...12).map { String(format: "Folder %02d", $0) }
-        let counts = Self.articleCounts(total: articleCount)
-        let feeds = (0..<Self.feedCount).map { index in
-            Feed(
-                id: Self.feedID(index),
-                title: "Perf Feed \(String(format: "%03d", index + 1)) 성능 뉴스",
-                siteDescription: "Deterministic performance feed \(index + 1)",
-                category: folders[index % folders.count],
-                systemImage: "dot.radiowaves.left.and.right",
-                feedURL: URL(string: "http://127.0.0.1:8765/f/\(index).xml")!,
-                siteURL: URL(string: "http://127.0.0.1:8765/site/\(index)")!,
-                healthScore: 1,
-                lastFetchedAt: Self.referenceDate
-            )
-        }
-
-        var articles: [Article] = []
-        articles.reserveCapacity(articleCount)
-        var byFeed = Array(repeating: [Article](), count: Self.feedCount)
-        var globalIndex = 0
-        for feedIndex in 0..<Self.feedCount {
-            byFeed[feedIndex].reserveCapacity(counts[feedIndex])
-            for localIndex in 0..<counts[feedIndex] {
-                let id = "perf-item-\(feedIndex)-\(localIndex)"
-                let category = "perf-cat-\((globalIndex % 8) + 1)"
-                let title = Self.makeTitle(index: globalIndex, rng: &rng)
-                let summary = Self.makeSummary(index: globalIndex, keyword: category, rng: &rng)
-                let article = Article(
-                    id: id,
-                    feedID: feeds[feedIndex].id,
-                    title: title,
-                    summary: summary,
-                    bodyParagraphs: [],
-                    publishedAt: Self.referenceDate.addingTimeInterval(TimeInterval(-globalIndex * 113)),
-                    url: URL(string: "http://127.0.0.1:8765/article/\(feedIndex)/\(localIndex)")!,
-                    estimatedReadMinutes: 1 + Int(rng.next() % 12),
-                    isRead: false,
-                    isStarred: false
-                )
-                articles.append(article)
-                byFeed[feedIndex].append(article)
-                globalIndex += 1
-            }
-        }
+        let fixture = Self.makeFixture(articleCount: articleCount, rng: &rng)
+        let (feeds, folders, articles, byFeed) = (fixture.feeds, fixture.folders, fixture.articles, fixture.byFeed)
         #expect(articles.count == articleCount)
         #expect(byFeed[Self.feedCount - 2].count == 30)
-        #expect(byFeed[Self.feedCount - 1].count == counts.max())
+        #expect(byFeed[Self.feedCount - 1].count == Self.articleCounts(total: articleCount).max())
 
         let storage = ReaderStorage(directoryURL: outputURL)
         let library = ReaderLibrary(
@@ -151,6 +115,98 @@ struct PerfLibraryGenerator {
         print("perf.library articles=\(articles.count) unread=\(unread) starred=\(starred) feeds=\(feeds.count)")
     }
 
+    private struct Fixture {
+        let feeds: [Feed]
+        let folders: [String]
+        let articles: [Article]
+        let byFeed: [[Article]]
+    }
+
+    private static func makeFixture(articleCount: Int, rng: inout SplitMix64) -> Fixture {
+        let folders = (1...12).map { String(format: "Folder %02d", $0) }
+        let counts = articleCounts(total: articleCount)
+        let feeds = (0..<feedCount).map { index in
+            Feed(
+                id: feedID(index),
+                title: "Perf Feed \(String(format: "%03d", index + 1)) 성능 뉴스",
+                siteDescription: "Deterministic performance feed \(index + 1)",
+                category: folders[index % folders.count],
+                systemImage: "dot.radiowaves.left.and.right",
+                feedURL: URL(string: "http://127.0.0.1:8765/f/\(index).xml")!,
+                siteURL: URL(string: "http://127.0.0.1:8765/site/\(index)")!,
+                healthScore: 1,
+                lastFetchedAt: referenceDate
+            )
+        }
+
+        var articles: [Article] = []
+        articles.reserveCapacity(articleCount)
+        var byFeed = Array(repeating: [Article](), count: feedCount)
+        var globalIndex = 0
+        for feedIndex in 0..<feedCount {
+            byFeed[feedIndex].reserveCapacity(counts[feedIndex])
+            for localIndex in 0..<counts[feedIndex] {
+                // RSSFeedService builds "<feed.id>#<guid>" (RSSFeedService.swift:463)
+                // and ReaderStore re-keys it onto the library feed id, so the
+                // fixture must use the same shape or every refresh looks new.
+                let id = articleID(feedID: feeds[feedIndex].id, guid: "perf-item-\(feedIndex)-\(localIndex)")
+                let category = "perf-cat-\((globalIndex % 8) + 1)"
+                let title = makeTitle(index: globalIndex, rng: &rng)
+                let summary = makeSummary(index: globalIndex, keyword: category, rng: &rng)
+                let article = Article(
+                    id: id,
+                    feedID: feeds[feedIndex].id,
+                    title: title,
+                    summary: summary,
+                    bodyParagraphs: [],
+                    publishedAt: referenceDate.addingTimeInterval(TimeInterval(-globalIndex * 113)),
+                    url: URL(string: "http://127.0.0.1:8765/article/\(feedIndex)/\(localIndex)")!,
+                    estimatedReadMinutes: 1 + Int(rng.next() % 12),
+                    isRead: false,
+                    isStarred: false
+                )
+                articles.append(article)
+                byFeed[feedIndex].append(article)
+                globalIndex += 1
+            }
+        }
+        return Fixture(feeds: feeds, folders: folders, articles: articles, byFeed: byFeed)
+    }
+
+    private static func articleID(feedID: String, guid: String) -> String {
+        "\(feedID)#\(guid)"
+    }
+
+    /// Guards the refresh contract without generating files: a `none` feed must
+    /// parse into ids the library already holds, or B1 measures fake new items.
+    @Test("fixture ids match refreshed article ids")
+    func fixtureIDsMatchParsedIDs() throws {
+        var rng = SplitMix64(seed: 42)
+        let fixture = Self.makeFixture(articleCount: 5_000, rng: &rng)
+        let libraryIDs = Set(fixture.articles.map(\.id))
+        for index in [0, 29, 30, Self.feedCount - 2, Self.feedCount - 1] {
+            let feed = fixture.feeds[index]
+            func parsedIDs(_ variant: String) throws -> [String] {
+                let xml = Self.feedXML(feed: feed, index: index, current: fixture.byFeed[index], variant: variant)
+                let parsed = try FeedXMLParser(feedURL: feed.feedURL).parse(data: Data(xml.utf8))
+                // Mirrors ReaderStore's re-key of "<feedURL>#<guid>" onto the
+                // library feed id during refresh.
+                let prefix = parsed.feed.id + "#"
+                return parsed.articles.map { article in
+                    #expect(article.id.hasPrefix(prefix))
+                    return Self.articleID(feedID: feed.id, guid: String(article.id.dropFirst(prefix.count)))
+                }
+            }
+            let none = try parsedIDs("none")
+            #expect(none.count == min(Self.feedWindow, fixture.byFeed[index].count))
+            #expect(none.filter { !libraryIDs.contains($0) }.isEmpty, "feed \(feed.id) has new ids in none")
+            let trickleNew = try parsedIDs("trickle").filter { !libraryIDs.contains($0) }
+            #expect(trickleNew.count == (index < 30 ? 1 : 0))
+            let big1New = try parsedIDs("big1").filter { !libraryIDs.contains($0) }
+            #expect(big1New.count == (feed.id == "perf-feed-big" ? 3 : 0))
+        }
+    }
+
     private static func feedID(_ index: Int) -> String {
         if index == feedCount - 2 { return "perf-feed-small" }
         if index == feedCount - 1 { return "perf-feed-big" }
@@ -198,32 +254,42 @@ struct PerfLibraryGenerator {
         return String(value.prefix(220)).trimmingCharacters(in: .whitespaces)
     }
 
+    private static let feedVariants = ["none", "trickle", "burst", "big1"]
+    /// Real feeds publish a rolling window, not their whole history; serving
+    /// feed-big's ~1000 items would inflate B merge cost.
+    private static let feedWindow = 30
+
     private static func writeFeedVariants(feeds: [Feed], current: [[Article]], at root: URL) throws {
-        for variant in ["none", "trickle", "burst", "big1"] {
+        for variant in feedVariants {
             let directory = root.appending(path: variant).appending(path: "f")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             for index in feeds.indices {
-                var items = current[index]
-                let additions: Int
-                switch variant {
-                case "trickle": additions = index < 30 ? 1 : 0
-                case "burst": additions = 5
-                case "big1": additions = feeds[index].id == "perf-feed-big" ? 3 : 0
-                default: additions = 0
-                }
-                for extra in 0..<additions {
-                    items.insert(Article(
-                        id: "perf-new-\(index)-\(extra)", feedID: feeds[index].id,
-                        title: "New performance item \(extra + 1) 새 글", summary: "Deterministic refresh item",
-                        bodyParagraphs: [], publishedAt: referenceDate.addingTimeInterval(TimeInterval(60 + extra)),
-                        url: URL(string: "http://127.0.0.1:8765/new/\(index)/\(extra)")!,
-                        estimatedReadMinutes: 2, isRead: false, isStarred: false
-                    ), at: 0)
-                }
-                let xml = rss(feed: feeds[index], articles: items)
+                let xml = feedXML(feed: feeds[index], index: index, current: current[index], variant: variant)
                 try Data(xml.utf8).write(to: directory.appending(path: "\(index).xml"), options: [.atomic])
             }
         }
+    }
+
+    private static func feedXML(feed: Feed, index: Int, current: [Article], variant: String) -> String {
+        // `current` is newest-first, so the prefix is the feed's latest window.
+        var items = Array(current.prefix(feedWindow))
+        let additions: Int
+        switch variant {
+        case "trickle": additions = index < 30 ? 1 : 0
+        case "burst": additions = 5
+        case "big1": additions = feed.id == "perf-feed-big" ? 3 : 0
+        default: additions = 0
+        }
+        for extra in 0..<additions {
+            items.insert(Article(
+                id: articleID(feedID: feed.id, guid: "perf-new-\(index)-\(extra)"), feedID: feed.id,
+                title: "New performance item \(extra + 1) 새 글", summary: "Deterministic refresh item",
+                bodyParagraphs: [], publishedAt: referenceDate.addingTimeInterval(TimeInterval(60 + extra)),
+                url: URL(string: "http://127.0.0.1:8765/new/\(index)/\(extra)")!,
+                estimatedReadMinutes: 2, isRead: false, isStarred: false
+            ), at: 0)
+        }
+        return rss(feed: feed, articles: items)
     }
 
     /// ReaderStorage's compact shard encoder intentionally skips sorted keys for
@@ -251,7 +317,8 @@ struct PerfLibraryGenerator {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
         let items = articles.map { article in
-            "<item><guid isPermaLink=\"false\">\(xmlEscape(article.id))</guid><title>\(xmlEscape(article.title))</title><link>\(xmlEscape(article.url.absoluteString))</link><description>\(xmlEscape(article.summary))</description><pubDate>\(formatter.string(from: article.publishedAt))</pubDate></item>"
+            let guid = article.id.hasPrefix(feed.id + "#") ? String(article.id.dropFirst(feed.id.count + 1)) : article.id
+            return "<item><guid isPermaLink=\"false\">\(xmlEscape(guid))</guid><title>\(xmlEscape(article.title))</title><link>\(xmlEscape(article.url.absoluteString))</link><description>\(xmlEscape(article.summary))</description><pubDate>\(formatter.string(from: article.publishedAt))</pubDate></item>"
         }.joined()
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\"><channel><title>\(xmlEscape(feed.title))</title><link>\(xmlEscape(feed.siteURL.absoluteString))</link><description>\(xmlEscape(feed.siteDescription))</description>\(items)</channel></rss>"
     }

@@ -11,8 +11,8 @@ var posted = 0
 
 func post(
     delta: Int32,
-    phase: CGScrollPhase,
-    momentum: CGScrollPhase = CGScrollPhase(rawValue: 0)!
+    phase: CGScrollPhase?,
+    momentum: CGMomentumScrollPhase = .none
 ) {
     guard let event = CGEvent(
         scrollWheelEvent2Source: eventSource,
@@ -23,7 +23,7 @@ func post(
         wheel3: 0
     ) else { return }
     event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-    event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
+    event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
     event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum.rawValue))
     event.post(tap: .cghidEventTap)
     posted += 1
@@ -52,12 +52,14 @@ case .fling:
     var velocity = 96.0
     var first = true
     while velocity >= 1 {
-        post(delta: -Int32(velocity.rounded()), phase: CGScrollPhase(rawValue: 0)!, momentum: first ? .began : .changed)
+        // Momentum events carry no gesture phase and use CGMomentumScrollPhase
+        // (begin=1, continue=2, end=3), not CGScrollPhase (ended=4).
+        post(delta: -Int32(velocity.rounded()), phase: nil, momentum: first ? .begin : .continuous)
         first = false
         velocity *= 0.90
         usleep(16_667)
     }
-    post(delta: 0, phase: CGScrollPhase(rawValue: 0)!, momentum: .ended)
+    post(delta: 0, phase: nil, momentum: .end)
 }
 
 print("wheel.events posted=\(posted) mode=\(mode.rawValue)")
