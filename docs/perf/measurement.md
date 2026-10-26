@@ -35,7 +35,7 @@
 **① 시나리오 마커와 통계** (`MainThreadLog`에 추가)
 - `scenarioBegin(name:)`은 `totals` 스냅샷, stall 목록 길이, 프레임 카운터를 저장합니다.
 - `scenarioEnd()`는 그 차이를 한 줄로 기록합니다(줄 형식은 4절).
-- 시작할 때 한 번 `run.begin label=<NookPerfLabel> sha=<git> lib=<id> hz=<display Hz> opt=<-O|-Onone> log=<MainThreadLog.url>`를 남깁니다. `opt`는 컴파일 시점에 정해지는 `_isDebugAssertConfiguration()`에서 옵니다.
+- 시작할 때 한 번 `run.begin label=<NookPerfLabel> sha=<git> binarySha=<built git> lib=<id> hz=<display Hz> opt=<-O|-Onone> log=<MainThreadLog.url>`를 남깁니다. `opt`는 컴파일 시점에 정해지는 `_isDebugAssertConfiguration()`에서 옵니다.
 - 로그 경로는 서명/샌드박스 여부에 따라 바뀝니다. `CODE_SIGNING_ALLOWED=NO` 빌드는 entitlement가 없어 컨테이너 밖 `$TMPDIR`에 씁니다. 그래서 경로를 추측하지 말고 로그에 찍힌 `log=` 값을 씁니다.
 
 **② Watchdog을 촘촘하게**
@@ -176,7 +176,7 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 `tools/perf/run.sh [--only <ID>] <label> <lib> <script>`가 다음을 순서대로 합니다.
 1. rsync로 라이브러리 복원
 2. 피드 서버 실행
-3. `DerivedData-perf/Build/Products/Debug/Nook.app/Contents/MacOS/Nook -NookPerfLibrary … -NookPerfScript … -NookPerfLabel <label> -NookPerfLog <launch.XXXXXX>/ui-forensics.log -NookStallMs 50 -autoRefreshEnabled NO -nookPlusSessionConfigured NO -geminiKeyConfigured NO …`를 **직접 실행**하고 그 PID를 기다립니다. `open`은 쓰지 않습니다. watchdog이 60초 안에 `perf.library`가 없거나 전체 상한(600초, `refresh*`는 300초)을 넘으면 그 자식 PID에만 TERM→KILL을 보내고 `perf.driver.error reason=launch-timeout`을 남긴 뒤 124로 끝냅니다.
+3. `DerivedData-perf/Build/Products/Debug/Nook.app/Contents/MacOS/Nook -NookPerfLibrary … -NookPerfScript … -NookPerfLabel <label> -NookPerfLog <launch.XXXXXX>/ui-forensics.log -NookStallMs 50 -autoRefreshEnabled NO -SUEnableAutomaticChecks NO -nookPlusSessionConfigured NO -geminiKeyConfigured NO …`를 **직접 실행**하고 그 PID를 기다립니다. `open`은 쓰지 않습니다. watchdog이 60초 안에 `perf.library`가 없거나 전체 상한(600초, `refresh*`는 300초)을 넘으면 그 자식 PID에만 TERM→KILL을 보내고 `perf.driver.error reason=launch-timeout`을 남긴 뒤 124로 끝냅니다.
 4. 로그를 `perf-runs/<label>/<lib>-<script>[-<ID>]-<variant>-<n>.log`로 옮기고, `run.begin opt=`가 `-O`인지 확인하기
 
 로그는 append 방식이므로 실행마다 파일을 옮겨 **실행 단위로 분리**합니다. 시간 간격으로 실행을 가르는 방식에는 의존하지 않습니다.
@@ -185,7 +185,11 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 - **서명 안 된 빌드의 Keychain 프롬프트.** `ContentView.init`이 만드는 `PlusStore`가 `PlusCredential.current`(`SecItemCopyMatching`)를 읽다가, 아무도 응답하지 않는 Keychain 접근 프롬프트에서 메인 스레드가 멈췄습니다. `-NookPerfLibrary`가 있으면(`PerfLaunch.isActive`) `PlusCredential.current`와 `GeminiCredential.apiKey`는 Keychain을 건드리지 않고 nil을 돌려줍니다. 그러면 Plus 호출이 `.sessionInvalid`로 실패해 sign-out을 부르므로, 쓰기 경로(`PlusCredential.store`/`signOut`, `GeminiCredential.setAPIKey`, `PlusOwnFeed.remember`, 로컬 앱 초기화)도 perf 실행에서는 아무것도 하지 않거나 실패합니다. 실제 Keychain 항목과 그 UserDefaults 플래그는 지워지지도 다시 쓰이지도 않습니다.
 - **초기 창 없음.** 저장된 앱 상태 없이 직접 실행한 자식은 `Window("main")`을 받지 못했습니다. 실행 1초 뒤에도 보이는 창이 없으면 DEBUG launch hook이 자기 프로세스에 `kAEReopenApplication`(Dock 클릭과 같은 이벤트)을 보내고, 3초에 한 번 더 시도합니다. 창은 SwiftUI의 기본 reopen 처리로 열리고, `Window`는 단일 인스턴스라 두 번째 창이 생기지 않습니다.
 
-run.sh는 `/Applications/Nook.app`, 저장소 밖의 앱(`NOOK_PERF_ALLOW_EXTERNAL_APP=1`이 없으면), 팀 서명된 앱, DEBUG perf hook이 없는 빌드를 띄우지 않습니다. 실행마다 `perf-runs/.work/<label>/launch.XXXXXX/`에 `stdout.log`/`stderr.log`가 남고, 실패 메시지가 그 `stderr.log`를 알려줍니다.
+run.sh는 `/Applications/Nook.app`, 저장소 밖의 앱(`NOOK_PERF_ALLOW_EXTERNAL_APP=1`이 없으면), 팀 서명된 앱, 현재 HEAD와 dirty 상태에 맞는 perf-build stamp가 없는 빌드를 띄우지 않습니다. `make perf-build`는 incremental build에서도 Debug 결과물의 Info.plist에 전체 SHA와 dirty 상태를 `NookBuildSHA`로 기록하고, 앱이 이를 `run.begin binarySha=`로 읽습니다. 커밋(문서만 바뀐 경우 포함)이나 소스 수정 뒤에는 다시 빌드합니다. dirty 플래그는 미커밋 수정 내용 자체의 해시가 아닙니다. 경로 비교에는 심볼릭 링크를 해소한 실제 경로를 씁니다. 실행마다 `perf-runs/.work/<label>/launch.XXXXXX/`에 `stdout.log`/`stderr.log`가 남고, 실패 메시지가 그 `stderr.log`를 알려줍니다.
+
+perf 모드의 `UpdateController`는 pending update를 읽거나 Sparkle을 생성하기 전에 반환하므로 appcast fetch, 업데이트 chip, Sparkle의 SU* 및 pending-update defaults 쓰기가 없습니다. `@AppStorage`나 sort order 같은 나머지 defaults 쓰기는 서명 안 된 개발 빌드의 preferences 도메인에 생길 수 있으며, 설치된 sandbox 앱의 container 도메인과는 별개입니다.
+
+run-all은 자신의 INT/TERM trap이 실행된 경우에만 전체 matrix를 중단하고 해당 그룹을 `groups.txt`에 aborted로 남깁니다. 자식의 130/143 종료만으로는 matrix를 중단하지 않습니다. run.sh는 app/xctrace의 signal 종료를 `perf.driver.error reason=signal`로 기록하고 1로 정규화하며, 자신의 INT/TERM trap에만 130/143을 사용합니다.
 
 ### 노이즈 통제
 - 같은 머신, 전원 연결, 다른 앱 종료, Low Power 꺼짐

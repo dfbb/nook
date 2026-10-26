@@ -41,11 +41,12 @@ public enum MainThreadLog {
             .map { URL(fileURLWithPath: $0).lastPathComponent } ?? "default"
         let sha = launchValue("-NookPerfSHA", in: arguments)
             ?? ProcessInfo.processInfo.environment["NOOK_GIT_SHA"] ?? "unknown"
+        let binarySha = Bundle.main.object(forInfoDictionaryKey: "NookBuildSHA") as? String ?? "unknown"
         let hz = NSScreen.main?.maximumFramesPerSecond ?? 0
         // Folded at compile time: true only for an unoptimized (-Onone) build, so
         // runs from `make build` and `make perf-build` can never be compared unseen.
         let opt = _isDebugAssertConfiguration() ? "-Onone" : "-O"
-        raw("run.begin label=\(token(label)) sha=\(token(sha)) lib=\(token(library)) hz=\(hz) opt=\(opt) log=\(url.path)")
+        raw("run.begin label=\(token(label)) sha=\(token(sha)) binarySha=\(token(binarySha)) lib=\(token(library)) hz=\(hz) opt=\(opt) log=\(url.path)")
         flush()
     }
 

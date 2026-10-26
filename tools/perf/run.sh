@@ -22,10 +22,9 @@ label="$1"
 lib_arg="$2"
 script_arg="$3"
 variant="${4:-none}"
-repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+repo_root="$(cd "$(dirname "$0")/../.." && pwd -P)"
 # `make perf-build` (-O, DEBUG instrumentation kept). NOOK_PERF_APP points
-# elsewhere, e.g. at the -Onone `make build` app, which also needs
-# NOOK_PERF_ALLOW_ONONE=1 to pass the check after the run.
+# elsewhere, but that build must also carry a current perf-build stamp.
 app="${NOOK_PERF_APP:-$repo_root/DerivedData-perf/Build/Products/Debug/Nook.app}"
 executable="$app/Contents/MacOS/Nook"
 port=8765
@@ -41,7 +40,7 @@ done
 case "$variant" in none | trickle | burst | big1) ;; *) echo "unknown feed variant: $variant" >&2; exit 2 ;; esac
 
 if [[ -d "$lib_arg" ]]; then
-  golden="$(cd "$lib_arg" && pwd)"
+  golden="$(cd "$lib_arg" && pwd -P)"
 else
   golden="$repo_root/perf-data/golden/$lib_arg"
 fi
@@ -49,7 +48,7 @@ fi
 [[ -f "$script_arg" ]] || { echo "scenario script not found: $script_arg" >&2; exit 1; }
 [[ -x "$executable" ]] || { echo "perf app not found: $app (run make perf-build first)" >&2; exit 1; }
 # Never let an override launch the user's installed app, or any build without
-# the DEBUG perf hooks that keep a run off the real Keychain and defaults.
+# the perf-build stamp that identifies the guarded DEBUG build.
 if [[ "$app" -ef /Applications/Nook.app ]]; then
   echo "refusing to launch the installed /Applications/Nook.app" >&2
   exit 2
@@ -65,9 +64,15 @@ if [[ -n "$team" && "$team" != "not set" ]]; then
   echo "refusing to launch an app signed by team $team: $app (perf builds are unsigned)" >&2
   exit 2
 fi
-# A `make build` app keeps its code in Nook.debug.dylib beside the executable.
-if ! LC_ALL=C grep -aqr -- '-NookPerfLibrary' "$app/Contents/MacOS"; then
-  echo "refusing to launch a build without DEBUG perf hooks: $app" >&2
+# Only make perf-build stamps its DEBUG product, including incremental builds.
+# Compare build identity, not mtimes or strings predating the Keychain guards.
+sha="$(git -C "$repo_root" rev-parse HEAD)"
+if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]]; then
+  sha="${sha}-dirty"
+fi
+binary_sha="$(/usr/libexec/PlistBuddy -c 'Print :NookBuildSHA' "$app/Contents/Info.plist" 2>/dev/null || true)"
+if [[ "$binary_sha" != "$sha" ]]; then
+  echo "refusing unstamped or stale perf build: binarySha=${binary_sha:-missing} HEAD=$sha (run make perf-build)" >&2
   exit 2
 fi
 
@@ -76,7 +81,7 @@ script_name="$(basename "$script_arg")"
 script_name="${script_name%.*}"
 # The log name keeps the step, so per-step launches stay apart in perf-runs/.
 [[ -z "$only" ]] || script_name="$script_name-${only//,/+}"
-data_root="$(cd "$golden/../.." && pwd)"
+data_root="$(cd "$golden/../.." && pwd -P)"
 # Feed XML is generated per library, so lib-10k never serves lib-20k's items.
 feed_root="$data_root/feeds/$lib_name/$variant"
 [[ -d "$feed_root" ]] || { echo "feed variant not found: $feed_root (regenerate $lib_name)" >&2; exit 1; }
@@ -142,8 +147,9 @@ cleanup() {
   wait "$server_pid" 2>/dev/null || true
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+interrupted=0
+trap 'interrupted=130; exit "$interrupted"' INT
+trap 'interrupted=143; exit "$interrupted"' TERM
 
 server_ready=0
 for _ in {1..50}; do
@@ -160,20 +166,12 @@ for _ in {1..50}; do
 done
 [[ "$server_ready" -eq 1 ]] || { echo "feed server did not become ready; see $server_log" >&2; exit 1; }
 
-sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
-  sha="${sha}-dirty"
-fi
-head_time="$(git -C "$repo_root" log -1 --format=%ct 2>/dev/null || echo 0)"
-binary_time="$(stat -f %m "$executable" 2>/dev/null || echo 0)"
-if [[ "$head_time" =~ ^[0-9]+$ && "$binary_time" =~ ^[0-9]+$ && "$binary_time" -lt "$head_time" ]]; then
-  echo "warning: Nook binary is older than HEAD; run make perf-build before trusting sha=$sha" >&2
-fi
 launch_args=(
   -ApplePersistenceIgnoreState YES
   -NSQuitAlwaysKeepsWindows NO
+  -SUEnableAutomaticChecks NO
   -NookPerfLibrary "$working"
-  -NookPerfScript "$(cd "$(dirname "$script_arg")" && pwd)/$(basename "$script_arg")"
+  -NookPerfScript "$(cd "$(dirname "$script_arg")" && pwd -P)/$(basename "$script_arg")"
   -NookPerfLabel "$label"
   -NookPerfSHA "$sha"
   -NookStallMs 50
@@ -233,8 +231,8 @@ else
 fi
 watchdog_pid=""
 child_pid=""
+trace_status=0
 if [[ -n "$trace_pid" ]]; then
-  trace_status=0
   stop_trace || trace_status=$?
   if [[ "$status" -eq 0 && "$trace_status" -ne 0 ]]; then status=$trace_status; fi
 fi
@@ -244,6 +242,10 @@ if [[ -f "$timeout_marker" ]]; then
   echo "perf.driver.error reason=launch-timeout phase=$(cat "$timeout_marker") libraryLimit=$library_timeout totalLimit=$run_timeout" >>"$destination"
   echo "launch timed out; see $destination and $launch_tmp/stderr.log" >&2
   status=124
+elif (( status > 128 || trace_status > 128 )); then
+  echo "perf.driver.error reason=signal status=$status traceStatus=$trace_status" >>"$destination"
+  echo "child or trace was killed by a signal; see $destination" >&2
+  status=1
 elif [[ "$status" -ne 0 ]]; then
   echo "perf.driver.error reason=child-exit status=$status" >>"$destination"
   echo "child exited with status $status; see $launch_tmp/stderr.log" >&2

@@ -59,22 +59,34 @@ A single run takes a label (`[A-Za-z0-9._-]`,
 no leading dot), library (a generated name or directory), driver JSON, and
 optional feed variant. `--only ID[,ID]` runs just those steps
 (`-NookPerfOnly`) and adds the ids to the log name. Port 8765 must be free; the runner refuses to start
-next to a stale feed server. It passes `-NookPerfSHA` with the current short
-HEAD plus `-dirty` when tracked changes exist, and warns if the app binary is
-older than HEAD. Each child receives an explicit `-NookPerfLog` path beneath
+next to a stale feed server. `make perf-build` stamps the full HEAD SHA plus
+`-dirty` when tracked changes exist into the built Debug Info.plist's
+`NookBuildSHA`, even when an incremental build does not relink. The runner
+refuses a missing stamp or one that differs from the current HEAD and dirty
+flag; rebuild after every commit (including docs-only commits) or source edit.
+The dirty flag does not fingerprint uncommitted edits. `-NookPerfSHA` carries
+the current checkout identity, and `run.begin binarySha=` reads the build stamp
+directly from the app bundle. Each child receives an explicit `-NookPerfLog` path beneath
 `perf-runs/.work/<label>/` (Foundation may ignore `TMPDIR`); its log is archived as
 `perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`. The runner never reads or
 moves the real Nook container log or changes the installed app's defaults.
+Other app defaults (for example `@AppStorage` and sort orders) may still be
+written in the unsigned-build preferences domain, separate from the installed
+sandboxed app's container domain.
 
 The runner executes `Nook.app/Contents/MacOS/Nook` directly as its child
 (never `open`) and waits for that PID; only that PID is ever signalled. It
 refuses `/Applications/Nook.app`, an app outside the repository unless
 `NOOK_PERF_APP` is paired with `NOOK_PERF_ALLOW_EXTERNAL_APP=1`, a
-team-signed app (perf builds are unsigned), and any build without the DEBUG
-perf hooks. Saved-window restoration is disabled for the launch via
+team-signed app (perf builds are unsigned), and any build without a matching
+perf-build stamp. A plain `make build` product has no stamp and is refused. Saved-window restoration is disabled for the launch via
 argument-domain defaults, which are never persisted. So are
 `nookPlusSessionConfigured` and `geminiKeyConfigured` (both `NO`), so the UI
-and Plus code never believe a session or key exists.
+and Plus code never believe a session or key exists. The runner also passes
+`-SUEnableAutomaticChecks NO`. In DEBUG perf mode `UpdateController` returns
+before reading pending updates or creating Sparkle, so no appcast fetch, update
+chip, or Sparkle `SU*`/pending-update defaults write occurs (including manual
+update actions, which have no updater to call).
 
 Two causes of a launch that logs `run.begin` but never reaches
 `perf.library` were verified with `sample`; both fixes are DEBUG-only and
@@ -152,8 +164,11 @@ tools/perf/run-all.sh before-$(git rev-parse --short HEAD)
 `run-all.sh` refuses a label whose `perf-runs/<label>` directory is non-empty,
 so a retry cannot silently mix more than five repetitions into a median. Use a
 new label after an interrupted matrix. A failed launch skips the remaining
-launches in that group; other groups continue. Ctrl-C (or a run.sh exit of
-130/143) aborts the whole matrix instead of moving on to the next group. The final `groups.txt` summary
+launches in that group; other groups continue. Only run-all's own INT/TERM
+trap aborts the matrix; child exit codes 130/143 alone count as group failures.
+The runner logs signal-killed app/trace failures as `reason=signal` and exits 1,
+reserving 130/143 for its own INT/TERM traps. An interrupted group is recorded
+as aborted in `groups.txt` before exit. The final `groups.txt` summary
 records every group outcome, and any failure makes run-all exit 1. B3 and E3 wait for ambient refresh to
 finish; with 300 feeds, two fetches at a time, and the deterministic 50–800 ms
 latency they normally take about 65 seconds each. An interactive six-at-a-time

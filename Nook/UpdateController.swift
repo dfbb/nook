@@ -1,4 +1,5 @@
 import Foundation
+import NookKit
 import Observation
 import Sparkle
 
@@ -37,7 +38,7 @@ final class UpdateController: NSObject {
     /// The running app's version string ("1.2.3"), shown as the "current" version.
     let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
 
-    @ObservationIgnored private var updaterController: SPUStandardUpdaterController!
+    @ObservationIgnored private var updaterController: SPUStandardUpdaterController?
 
     /// The running app's build number (CFBundleVersion).
     private static var currentBuild: Int {
@@ -46,6 +47,11 @@ final class UpdateController: NSObject {
 
     private override init() {
         super.init()
+        #if DEBUG
+        // Do not create Sparkle or restore its pending chip during a perf run.
+        // Even updater startup can write SU* defaults before a scheduled check.
+        if PerfLaunch.isActive { return }
+        #endif
 
         // Restore a previously-found update so the chip shows immediately on
         // launch, but only if it is still newer than what's running. Once the
@@ -72,15 +78,15 @@ final class UpdateController: NSObject {
 
     /// Bound to the "Check for updates automatically" toggle in Settings.
     var automaticallyChecksForUpdates: Bool {
-        get { updaterController.updater.automaticallyChecksForUpdates }
-        set { updaterController.updater.automaticallyChecksForUpdates = newValue }
+        get { updaterController?.updater.automaticallyChecksForUpdates ?? false }
+        set { updaterController?.updater.automaticallyChecksForUpdates = newValue }
     }
 
     /// Runs a user-initiated check. Sparkle presents its standard, focused
     /// dialog (version, release notes, install + progress). Used by the chip's
     /// popover and Settings' "Check Now".
     func checkForUpdates() {
-        updaterController.checkForUpdates(nil)
+        updaterController?.checkForUpdates(nil)
     }
 
     private func recordPending(_ item: SUAppcastItem) {

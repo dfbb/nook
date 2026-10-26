@@ -16,7 +16,7 @@ fi
 
 label="$1"
 [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "invalid label: $label" >&2; exit 2; }
-repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+repo_root="$(cd "$(dirname "$0")/../.." && pwd -P)"
 script_dir="${NOOK_PERF_SCRIPTS:-$repo_root/tools/perf/scripts}"
 runner="$repo_root/tools/perf/run.sh"
 run_dir="$repo_root/perf-runs/$label"
@@ -71,13 +71,21 @@ PY
 }
 
 run() {
-  "$runner" ${xctrace[@]+"${xctrace[@]}"} "$label" "$@"
+  [[ "$interrupted" -eq 0 ]] || return "$interrupted"
+  local status=0
+  "$runner" ${xctrace[@]+"${xctrace[@]}"} "$label" "$@" || status=$?
+  [[ "$interrupted" -eq 0 ]] || return "$interrupted"
+  return "$status"
 }
 
 run_only() {
   local step="$1"
   shift
-  "$runner" ${xctrace[@]+"${xctrace[@]}"} --only "$step" "$label" "$@"
+  [[ "$interrupted" -eq 0 ]] || return "$interrupted"
+  local status=0
+  "$runner" ${xctrace[@]+"${xctrace[@]}"} --only "$step" "$label" "$@" || status=$?
+  [[ "$interrupted" -eq 0 ]] || return "$interrupted"
+  return "$status"
 }
 
 # Refresh-driven steps consume their new items on the first rep, so each rep
@@ -134,23 +142,24 @@ group_misc() {
 
 # Ctrl-C reaches run.sh and this script alike: stop the whole matrix, not
 # just the current launch.
-trap 'exit 130' INT
-trap 'exit 143' TERM
+interrupted=0
+trap 'interrupted=130' INT
+trap 'interrupted=143' TERM
 
 failed=0
 summary="$run_dir/groups.txt"
 for group in switch refresh scroll toggle misc; do
-  if case "$group" in
+  status=0
+  case "$group" in
     switch) group_switch ;; refresh) group_refresh ;; scroll) group_scroll ;;
     toggle) group_toggle ;; misc) group_misc ;;
-  esac; then
+  esac || status=$?
+  if [[ "$interrupted" -ne 0 ]]; then
+    echo "$group: aborted (exit=$interrupted; remaining groups skipped)" | tee -a "$summary" >&2
+    exit "$interrupted"
+  elif [[ "$status" -eq 0 ]]; then
     echo "$group: succeeded" | tee -a "$summary"
   else
-    status=$?
-    if [[ "$status" -eq 130 || "$status" -eq 143 ]]; then
-      echo "$group: aborted (exit=$status; remaining groups skipped)" | tee -a "$summary" >&2
-      exit "$status"
-    fi
     echo "$group: failed (exit=$status; remaining launches in group skipped)" | tee -a "$summary" >&2
     failed=1
   fi
