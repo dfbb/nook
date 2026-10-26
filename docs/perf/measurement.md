@@ -100,12 +100,12 @@ NOOK_GEN_PERF_LIB=$PERF/golden/lib-10k NOOK_GEN_N=10000 swift test --package-pat
 ```
 
 ### 새로고침용 피드 XML과 로컬 서버
-- 같은 생성기가 `$PERF/feeds/<variant>/f/<n>.xml`을 만듭니다. guid는 라이브러리와 같습니다.
+- 같은 생성기가 `$PERF/feeds/<lib>/<variant>/f/<n>.xml`을 만듭니다. guid는 라이브러리와 같습니다.
   - `none`: 새 글 0. 가짜 changed가 나는지 봅니다.
   - `trickle`: 30개 피드에 새 글 +1.
   - `burst`: 모든 피드에 새 글 +5.
   - `big1`: `feed-big`에만 새 글 +3.
-- 서버는 `tools/perf/feedserver.py --root $PERF/feeds/<variant> --port 8765 --latency-seed 7`입니다. 요청마다 50~800ms 지연을 결정적으로 주어 실제 flush 간격(400ms)과 비슷하게 만듭니다. `Info.plist`의 ATS 설정이 cleartext를 허용하는지 첫 실행에서 `run.begin` 이후 fetch 에러 수로 확인합니다.
+- 서버는 `tools/perf/feedserver.py --root $PERF/feeds/<lib>/<variant> --port 8765 --latency-seed 7`입니다. 요청마다 50~800ms 지연을 결정적으로 주어 실제 flush 간격(400ms)과 비슷하게 만듭니다. `Info.plist`의 ATS 설정이 cleartext를 허용하는지 첫 실행에서 `run.begin` 이후 fetch 에러 수로 확인합니다.
 
 ### 앱이 생성 라이브러리를 쓰게 하기 (DEBUG launch arg)
 - `-NookPerfLibrary <dir>`를 주면 `restoreStorageIfPossible`(ReaderStore:4157)이 bookmark 대신 `ReaderStorage(directoryURL: dir)`를 씁니다.
@@ -121,10 +121,10 @@ NOOK_GEN_PERF_LIB=$PERF/golden/lib-10k NOOK_GEN_N=10000 swift test --package-pat
 
 `Nook/PerfDriver.swift`(`#if DEBUG`, `@MainActor`)를 둡니다. `-NookPerfScript <json>`을 받으면 라이브러리 로드가 끝난 뒤 단계를 차례로 실행하고, 끝나면 `MainThreadLog.flush()`를 부르고 `NSApp.terminate`합니다.
 - 드라이버는 공개 API를 **어댑터 한 겹**을 거쳐 호출합니다: `selectSmartSource`, `feedSelection`, 카테고리 선택, `refreshAll()`, `refresh(feedID:)`, `refreshOnActivation(honorThrottle:false)`, `setRead`, `toggleStarred`, `selectedArticleID`. 그래서 Phase 사이에 이름이 바뀌어도 고칠 곳은 어댑터뿐입니다.
-- 모든 단계의 형태는 같습니다: `settle`(2초 동안 stall 0, `isRefreshing == false`) → `scenarioBegin` → 동작 → `quiesce`(1.5초 동안 publish 0 + refresh 끝, 최대 30초) → `scenarioEnd`.
+- 모든 단계의 형태는 같습니다: `settle`(2초 동안 stall 0, `isRefreshing == false`) → `scenarioBegin` → 동작 → `quiesce`(1.5초 동안 publish·settle·stall 0 + refresh 끝, 최대 180초) → `scenarioEnd`.
 - 시나리오마다 5회 반복합니다. **cold**(실행 직후 첫 전환)는 A1에만 `coldFirst:true`로 rep 0을 붙여 따로 1회 기록합니다(`cold=1`). 다른 단계의 rep은 모두 warm입니다.
 - 창은 드라이버가 1440×900으로 고정하고, split view의 사이드바 270pt·목록 420pt도 고정합니다(`perf.layout listWidth=…`로 확인). 행 수 = 보이는 높이이기 때문입니다. 창 frame/divider autosave는 끄고 시작하므로 앱 defaults에 1440×900이 저장되지 않습니다.
-- `quiesce`는 새로고침·publish·list/reader settle·stall이 1.5초 동안 없을 때 끝나고, 마지막 활동 시각을 시나리오의 활성 구간 끝으로 넘깁니다. 30초 안에 조용해지지 않으면 `perf.quiesce.timeout id=…`(settle이면 `perf.settle.timeout`)을 남기며, 그 rep은 버립니다.
+- `quiesce`는 새로고침·publish·list/reader settle·stall이 1.5초 동안 없을 때 끝나고, 마지막 활동 시각을 시나리오의 활성 구간 끝으로 넘깁니다. 180초(300개 피드 ambient 새로고침이 동시 2개로 ~64초 걸리므로) 안에 조용해지지 않으면 `perf.quiesce.timeout id=…`(settle이면 `perf.settle.timeout`)을 남기며, 그 rep은 버립니다.
 - 대상(피드/폴더/카테고리/행 index)을 찾지 못하거나 목록 스크롤 뷰가 없으면 `perf.driver.error …`를 남깁니다. 이 줄이 있는 실행은 무효입니다. 카테고리는 `"1"`/`"perf-cat-1"` 모두 id `perf-cat-1`로 찾습니다.
 
 ### 시나리오 (ID는 로그와 표에서 그대로 씁니다)
@@ -321,7 +321,7 @@ xcrun xctrace export --input … --xpath '/trace-toc/run[@number="1"]/data/table
 
 ## 8. 실행 순서
 1. **P0 커밋**: 계측 ①~④, 드라이버, 생성기, 피드 서버, perfreport. 제품 동작은 바꾸지 않습니다.
-2. 생성기로 `golden/lib-{5k,10k,20k}`와 `feeds/{none,trickle,burst,big1}`를 만듭니다.
+2. 생성기로 `golden/lib-{5k,10k,20k}`와 `feeds/<lib>/{none,trickle,burst,big1}`를 만듭니다.
 3. 기준선: `run.sh before-<P0 sha>`로 A/B/C/D를 lib별 5회씩 돌립니다. xctrace는 A1, B2, C1을 1회씩 돌립니다.
 4. Phase 1~4가 끝날 때마다 `after-p<N>`으로 같은 세트를 돌리고 `--compare` 표를 커밋 메시지나 보고서에 첨부합니다. Phase 5(NSTableView) 진행 여부는 C1/C5에서 "윈도 상한 패스 1회 >16ms"가 남는지로 판단합니다.
 5. 통과 후 계측을 제거할지 남길지 결정합니다. 스킬 원칙은 질문에 답이 나오면 제거하는 것입니다. 드라이버와 생성기는 회귀 방지용으로 남길 수 있습니다.

@@ -105,10 +105,11 @@ final class PerfDriver {
     /// Waits for 1.5s with no refresh, publish, settle or stall, and returns when
     /// the workload last showed activity — the end of the scenario's active window.
     /// Stability is checked before the deadline, so a stall that outlasts the
-    /// deadline but has ended is not reported as a timeout.
+    /// deadline but has ended is not reported as a timeout. The cap is generous
+    /// because an ambient refresh of 300 feeds, two fetches at a time, runs ~64s.
     private func quiesce(adapter: PerfStoreAdapter, id: String) async throws -> Double {
         var stableSince = ProcessInfo.processInfo.systemUptime
-        let deadline = stableSince + 30
+        let deadline = stableSince + 180
         while true {
             let now = ProcessInfo.processInfo.systemUptime
             if adapter.isRefreshing {
