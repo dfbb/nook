@@ -19,8 +19,14 @@ label="$1"
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 script_dir="${NOOK_PERF_SCRIPTS:-$repo_root/tools/perf/scripts}"
 runner="$repo_root/tools/perf/run.sh"
+run_dir="$repo_root/perf-runs/$label"
 derived_dir="$repo_root/perf-runs/.work/$label/scripts"
 reps=5
+
+if [[ -d "$run_dir" ]] && [[ -n "$(find "$run_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo "refusing to mix repetitions: $run_dir is not empty (choose a new label)" >&2
+  exit 1
+fi
 
 for group in switch scroll toggle misc; do
   [[ -f "$script_dir/$group.json" ]] || { echo "missing $script_dir/$group.json (set NOOK_PERF_SCRIPTS if scripts live elsewhere)" >&2; exit 1; }
@@ -28,10 +34,14 @@ done
 # B is split per feed variant (refresh-none/-trickle/-big1.json); an older
 # single refresh.json is still accepted.
 refresh_scripts=()
-for variant in none trickle burst big1; do
+for variant in none trickle big1; do
   [[ -f "$script_dir/refresh-$variant.json" ]] && refresh_scripts+=("refresh-$variant")
 done
-[[ ${#refresh_scripts[@]} -gt 0 || -f "$script_dir/refresh.json" ]] || { echo "missing $script_dir/refresh-<variant>.json" >&2; exit 1; }
+if [[ ${#refresh_scripts[@]} -ne 0 && ${#refresh_scripts[@]} -ne 3 ]]; then
+  echo "incomplete split refresh scripts: need refresh-{none,trickle,big1}.json" >&2
+  exit 1
+fi
+[[ ${#refresh_scripts[@]} -eq 3 || -f "$script_dir/refresh.json" ]] || { echo "missing $script_dir/refresh-{none,trickle,big1}.json (or legacy refresh.json)" >&2; exit 1; }
 mkdir -p "$derived_dir"
 
 # Writes a copy of <group>.json holding only the given step ids (or every step

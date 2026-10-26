@@ -40,7 +40,7 @@ THRESHOLDS = {
     "C.growMaxMs": (8.0, 8.0, "≤8"),
     "C.droppedPercent": (2.0, 2.0, "≤2%"),
     "C.missedSelection": (0.0, 0.0, "0"),
-    "D.updateInPlaceMs": (16.0, 16.0, "≤16"),
+    "D.updateInPlaceMs": (16.0, 16.0, "max ≤16"),
     "D.rowcontentPerToggle": (5.0, 5.0, "≤5"),
     "D.listBodyPerToggle": (1.0, 1.0, "≤1"),
     "D.readerTTFR": (100.0, 100.0, "≤100"),
@@ -66,7 +66,7 @@ TABLE_ROWS = [
     ("C5", "20k", "none", "growMaxMs", "growMaxMs"),
     ("C5", "20k", "none", "stalls100", "stalls≥100"),
     ("D1", "10k", "none", "readerTTFR", "reader ttfr ms"),
-    ("D2", "10k", "none", "updateInPlaceMs", "toggle ms"),
+    ("D2", "10k", "none", "updateInPlaceMs", "toggle max ms"),
     ("D2", "10k", "none", "rowcontentPerToggle", "rowcontent/toggle"),
 ]
 
@@ -188,15 +188,17 @@ def derived(scenario: str, values: dict[str, float]) -> None:
     if "mergeFlush" in values:
         flushes = values["mergeFlush"]
         values["mergeFallbackRatio"] = values.get("mergeFallback", 0) / flushes if flushes else 0.0
-    # updateInPlaceMs/rowcontent/body are scenario totals. A toggles= key wins;
-    # builds without it get the counts from toggle.json.
+    # updateInPlaceMs/rowcontent/body are scenario totals. Report the mean for
+    # diagnostics, but gate updateInPlaceMs on the logged worst individual
+    # toggle when available: one 40 ms toggle must not hide in a fast mean.
     toggles = values["toggles"] if "toggles" in values else TOGGLE_COUNTS.get(scenario)
     if toggles:
         values["rowcontentPerToggle"] = values.get("rowcontent", 0) / toggles
         values["listBodyPerToggle"] = values.get("body", 0) / toggles
         if "updateInPlaceMs" in values:
             values["updateInPlaceTotalMs"] = values["updateInPlaceMs"]
-            values["updateInPlaceMs"] = values["updateInPlaceMs"] / toggles
+            values["updateInPlaceMeanMs"] = values["updateInPlaceMs"] / toggles
+            values["updateInPlaceMs"] = values.get("updateInPlaceMaxMs", values["updateInPlaceMeanMs"])
     if "droppedPercent" not in values:
         if "droppedPct" in values:
             values["droppedPercent"] = values["droppedPct"]
@@ -242,11 +244,15 @@ def parse_text(text: str, path: str = "<sample>") -> tuple[list[Record], list[st
         # fall back to rep 0, which the driver reserves for the cold rep.
         opened = begun.pop(scenario, {})
         if "cold" in parsed:
-            cold = parsed["cold"] == "1"
+            marked_cold = parsed["cold"] == "1"
         elif "cold" in opened and opened.get("rep", parsed.get("rep")) == parsed.get("rep"):
-            cold = opened["cold"] == "1"
+            marked_cold = opened["cold"] == "1"
         else:
-            cold = parsed.get("rep") == "0"
+            marked_cold = parsed.get("rep") == "0"
+        # switch.json marks rep 0 on every A step, but only A1 is the first
+        # step after launch. A2–A14 are already warm and must not be reported as
+        # cold-launch samples.
+        cold = scenario == "A1" and marked_cold
         values = {key: parsed_value for key, value in parsed.items() if (parsed_value := number(value)) is not None}
         derived(scenario, values)
         records.append(Record(scenario, library, variant, cold, values, raw, path, window))
@@ -429,9 +435,10 @@ def selftest() -> None:
     cold_only, _ = parse_text("1 scenario.stats id=A1 rep=0 ttfr=5\n2 scenario.stats id=A1 rep=1 cold=1 ttfr=6")
     assert [r.cold for r in cold_only] == [True, True]
 
-    # Per-toggle: updateInPlaceMs/rowcontent/body are totals over 20 toggles.
+    # Per-toggle: gate on the worst logged toggle, retain totals/means for detail.
     assert metric(after, "D2", "10k", "none", "updateInPlaceMs")["median"] == 2
     assert metric(after, "D2", "10k", "none", "updateInPlaceTotalMs")["median"] == 40
+    assert metric(after, "D2", "10k", "none", "updateInPlaceMeanMs")["median"] == 2
     assert metric(after, "D2", "10k", "none", "rowcontentPerToggle")["median"] == 3
     assert metric(after, "D2", "10k", "none", "listBodyPerToggle")["median"] == 1
 
@@ -454,7 +461,7 @@ def selftest() -> None:
 
     report = compare(before, after, before_runs, after_runs)
     assert "| A1 | 10k | none | ttfr ms | 290 / 300 | 115 / 120 |" in report, report
-    assert "| D2 | 10k | none | toggle ms | 20 / 20 | 2 / 2 | -90.0% | ≤16 | PASS |" in report, report
+    assert "| D2 | 10k | none | toggle max ms | 20 / 20 | 2 / 2 | -90.0% | max ≤16 | PASS |" in report, report
     assert "| B2 | 10k | trickle | mergeMs p95 | – | 3 / 3 | – | ≤5 | PASS |" in report, report
     assert "| B1 | 10k | none | changedNoNew | – | 0 / 0 | – | 0 (B1) | PASS |" in report, report
     assert "| D1 | 10k | none | reader ttfr ms | – | – | – | ≤100 | NO DATA |" in report, report
@@ -469,11 +476,20 @@ def selftest() -> None:
     assert by_id[("B2", False)]["mergeP95"] == 4 and by_id[("B2", False)]["mergeFallbackRatio"] == 0
     assert by_id[("B2", False)]["publishPerDuration"] == 1  # activeDur 3000 → ceil(2)+1 = 3
     assert "ttfr" not in by_id[("B2", False)]
-    assert by_id[("D2", False)]["updateInPlaceMs"] == 5 and by_id[("D2", False)]["updateInPlaceMaxMs"] == 9
+    assert by_id[("D2", False)]["updateInPlaceMs"] == 9 and by_id[("D2", False)]["updateInPlaceMeanMs"] == 5
+    spike_records, _ = parse_text(
+        "1 run.begin lib=lib-10k\n2 scenario.stats id=D2 rep=1 toggles=20 updateInPlaceMs=40 updateInPlaceMaxMs=40",
+        "perf-runs/next/lib-10k-toggle-none-1.log",
+    )
+    spike = metric(summarize(spike_records), "D2", "10k", "none", "updateInPlaceMs")
+    assert spike == {"median": 40, "worst": 40, "n": 1}
+    assert verdict("D2", "10k", "updateInPlaceMs", spike)[1] == "FAIL"
     assert by_id[("D2", False)]["rowcontentPerToggle"] == 3
     assert by_id[("D1", False)]["readerTTFR"] == 80
     assert by_id[("C3", False)]["droppedPercent"] == 1.5 and by_id[("C3", False)]["missedSelection"] == 0
     assert all(r.variant == "trickle" for r in next_records)
+    false_cold, _ = parse_text("1 scenario.stats id=A2 rep=0 cold=1 ttfr=50")
+    assert len(false_cold) == 1 and not false_cold[0].cold
     print("perfreport selftest: PASS")
     print(report)
 

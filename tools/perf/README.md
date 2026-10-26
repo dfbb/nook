@@ -24,9 +24,10 @@ so every library has its own feed XML. Each feed serves only its newest 30
 items plus the variant's additions, like a real rolling feed. Article ids are
 `<feedID>#<guid>`, the shape `RSSFeedService`/`ReaderStore` produce on refresh,
 so `none` yields zero new articles; the always-on test
-`fixture ids match refreshed article ids` parses the XML with the real parser
-to keep it that way. Running the same command twice produces byte-identical
-fixture contents.
+`none XML merge has zero changed and zero new articles` parses all 300 XML files
+with the real parser, overlays the shard's read/star/category state, and calls
+the store merge hook to prove the article array is not republished. Running the
+same command twice produces byte-identical fixture contents.
 
 `Nook/Info.plist` currently has `NSAppTransportSecurity` →
 `NSAllowsArbitraryLoads=true`, so the cleartext `http://127.0.0.1:8765` feed
@@ -39,8 +40,10 @@ Build first with `make build`. A single run takes a label (`[A-Za-z0-9._-]`,
 no leading dot), library (a generated name or directory), driver JSON, and
 optional feed variant. Port 8765 must be free; the runner refuses to start
 next to a stale feed server. It passes `-NookPerfSHA` with the current short
-HEAD, archives any earlier `ui-forensics.log` (in `$TMPDIR` or the Nook
-container's tmp) to `perf-runs/.work/<label>/archived-logs`, and saves the
+HEAD plus `-dirty` when tracked changes exist, and warns if the app binary is
+older than HEAD. It archives an earlier `ui-forensics.log` from the process temp
+directory; the real Nook container is checked only for a signed build, and each
+move is printed. Archived logs go to `perf-runs/.work/<label>/archived-logs`; it saves the
 launch's log as `perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`:
 
 ```sh
@@ -68,6 +71,14 @@ Derived single-step scripts are written under `perf-runs/.work/<label>/scripts`:
 tools/perf/run-all.sh before-$(git rev-parse --short HEAD)
 ```
 
+`run-all.sh` refuses a label whose `perf-runs/<label>` directory is non-empty,
+so a retry cannot silently mix more than five repetitions into a median. Use a
+new label after an interrupted matrix. B3 and E3 wait for ambient refresh to
+finish; with 300 feeds, two fetches at a time, and the deterministic 50–800 ms
+latency they normally take about 65 seconds each. An interactive six-at-a-time
+refresh is about 21 seconds; the full matrix is typically 45–90 minutes (and can
+take longer for a pre-fix 20k build).
+
 For a real wheel-path check, make Nook frontmost and grant Accessibility access
 to the invoking Terminal/shell. `wheel.swift fling` posts phased wheel and
 momentum events; `constant` posts a three-second constant-velocity scroll:
@@ -92,8 +103,9 @@ name). Warm repetitions are summarized as median and worst; the cold rep
 (`cold=` on the stats or `scenario.begin` line, else rep 0) is kept separate,
 and `ttfr=-1` (no selection in the scenario) is not a sample. `mergeP95` is
 read as logged (older builds: `mergeMs`, which was the per-call p95);
-`publish/dur` uses `activeDur` when present; `updateInPlaceMs`, `rowcontent`,
-and `body` are divided by `toggles=` (or the count from `toggle.json`). `--trail ID` prints each rep's raw
+`publish/dur` uses `activeDur` when present; `updateInPlaceMs` is gated on
+`updateInPlaceMaxMs` (with total and mean retained), while `rowcontent` and
+`body` are divided by `toggles=` (or the count from `toggle.json`). `--trail ID` prints each rep's raw
 window from `scenario.begin` through `scenario.stats`. Compare output applies
 the thresholds from `docs/perf/measurement.md` and calls out every common
 lower-is-better metric whose median worsened by more than 10%, including rises

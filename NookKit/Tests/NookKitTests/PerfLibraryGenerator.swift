@@ -44,7 +44,7 @@ struct PerfLibraryGenerator {
         try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
 
         var rng = SplitMix64(seed: 42)
-        let fixture = Self.makeFixture(articleCount: articleCount, rng: &rng)
+        let fixture = try Self.makeFixture(articleCount: articleCount, rng: &rng)
         let (feeds, folders, articles, byFeed) = (fixture.feeds, fixture.folders, fixture.articles, fixture.byFeed)
         #expect(articles.count == articleCount)
         #expect(byFeed[Self.feedCount - 2].count == 30)
@@ -59,51 +59,25 @@ struct PerfLibraryGenerator {
         )
         try storage.save(library)
 
-        let categories = (1...8).map { index in
-            ArticleCategory(
-                id: "perf-cat-\(index)",
-                name: "Perf Category \(index)",
-                colorHex: ArticleCategory.defaultPalette[(index - 1) % ArticleCategory.defaultPalette.count],
-                order: index - 1,
-                keywords: ["perf-cat-\(index)"]
-            )
-        }
-        var shard = DeviceStateDocument(
-            deviceID: Self.deviceID,
-            clock: .zero,
-            updatedAt: Self.referenceDate
-        )
-        var clock = HLC(physicalMillis: 1_759_276_800_000, counter: 0, node: Self.deviceID)
-        func tick() -> HLC {
-            clock.counter &+= 1
-            return clock
-        }
-        for folder in folders { shard.setFolderPresent(folder, true, hlc: tick()) }
-        for category in categories { shard.setCategory(category.id, category, hlc: tick()) }
-        for feed in feeds {
-            shard.setFeedCategory(feed.id, feed.category, hlc: tick())
-            shard.setFeedSeed(feed.id, FeedSeed(from: feed), hlc: tick())
-        }
-        for (index, article) in articles.enumerated() {
-            let isRead = index % 5 >= 3 // exactly 40%; therefore exactly 60% unread.
-            let isStarred = index % 50 == 0 // exactly 2% for supported sizes.
-            shard.setArticleRead(article.id, isRead, hlc: tick())
-            shard.setArticleStarred(article.id, isStarred, hlc: tick())
-            shard.setArticleCategories(article.id, ["perf-cat-\((index % 8) + 1)"], hlc: tick())
-        }
-        shard.clock = clock
-        shard.generation = 1
+        let categories = Self.categories
+        let shard = Self.makeStateShard(feeds: feeds, folders: folders, articles: articles, categories: categories)
         try storage.saveShard(shard)
 
         let newest = articles.sorted(by: Article.isOrderedBefore).prefix(Self.bodyRetentionLimit)
-        let bodies = Dictionary(uniqueKeysWithValues: newest.map { article in
+        var bodies = Dictionary(uniqueKeysWithValues: articles.compactMap { article in
+            article.hasBody ? (article.id, article.body) : nil
+        })
+        for article in newest where !article.hasBody {
             let paragraphs = [
                 "\(article.title) 본문 첫 문단입니다. Performance fixture body paragraph one.",
                 "스크롤과 리더 로딩을 재현하는 결정적 본문입니다. Deterministic body paragraph two.",
             ]
-            return (article.id, ArticleBody(bodyParagraphs: paragraphs, contentHTML: "<p>\(Self.xmlEscape(paragraphs.joined(separator: "</p><p>")))</p>"))
-        })
-        try storage.saveContent(bodies, retain: Set(newest.map(\.id)))
+            bodies[article.id] = ArticleBody(
+                bodyParagraphs: paragraphs,
+                contentHTML: "<p>\(Self.xmlEscape(paragraphs.joined(separator: "</p><p>")))</p>"
+            )
+        }
+        try storage.saveContent(bodies, retain: Set(bodies.keys))
 
         // Every feed shares the localhost host key, matching ReaderStore.faviconKey(for:).
         try storage.writeFaviconData(Self.onePixelPNG, forKey: "127.0.0.1")
@@ -122,7 +96,7 @@ struct PerfLibraryGenerator {
         let byFeed: [[Article]]
     }
 
-    private static func makeFixture(articleCount: Int, rng: inout SplitMix64) -> Fixture {
+    private static func makeFixture(articleCount: Int, rng: inout SplitMix64) throws -> Fixture {
         let folders = (1...12).map { String(format: "Folder %02d", $0) }
         let counts = articleCounts(total: articleCount)
         let feeds = (0..<feedCount).map { index in
@@ -170,6 +144,21 @@ struct PerfLibraryGenerator {
                 globalIndex += 1
             }
         }
+        // The newest window is exactly what refresh serves. Build those stored
+        // values with the production parser, then re-key them exactly as
+        // ReaderStore does. This keeps every field used by Article equality —
+        // including bodyParagraphs/contentHTML/read time — identical on B1.
+        for feedIndex in feeds.indices {
+            let parsed = try parsedFeed(
+                feed: feeds[feedIndex],
+                index: feedIndex,
+                current: byFeed[feedIndex],
+                variant: "none"
+            )
+            let parsedByID = Dictionary(uniqueKeysWithValues: parsed.articles.map { ($0.id, $0) })
+            byFeed[feedIndex] = byFeed[feedIndex].map { parsedByID[$0.id] ?? $0 }
+        }
+        articles = byFeed.flatMap { $0 }
         return Fixture(feeds: feeds, folders: folders, articles: articles, byFeed: byFeed)
     }
 
@@ -177,34 +166,138 @@ struct PerfLibraryGenerator {
         "\(feedID)#\(guid)"
     }
 
-    /// Guards the refresh contract without generating files: a `none` feed must
-    /// parse into ids the library already holds, or B1 measures fake new items.
-    @Test("fixture ids match refreshed article ids")
-    func fixtureIDsMatchParsedIDs() throws {
+    /// Guards the complete B1 contract without writing files: after shard state
+    /// is materialized, a real `none` parse must add zero articles and trigger
+    /// no Article-array assignment in ReaderStore's current full-equality merge.
+    @Test("none XML merge has zero changed and zero new articles")
+    @MainActor
+    func noneRefreshMergeIsNoop() throws {
         var rng = SplitMix64(seed: 42)
-        let fixture = Self.makeFixture(articleCount: 5_000, rng: &rng)
-        let libraryIDs = Set(fixture.articles.map(\.id))
+        let fixture = try Self.makeFixture(articleCount: 5_000, rng: &rng)
+        let categories = Self.categories
+        let shard = Self.makeStateShard(
+            feeds: fixture.feeds,
+            folders: fixture.folders,
+            articles: fixture.articles,
+            categories: categories
+        )
+        let base = ReaderLibrary(
+            feeds: fixture.feeds,
+            articles: fixture.articles,
+            lastRefreshedAt: Self.referenceDate,
+            folders: fixture.folders
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "nook-perf-merge-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storage = ReaderStorage(directoryURL: directory)
+        try storage.save(base)
+        try storage.saveShard(shard)
+        let bodies = Dictionary(uniqueKeysWithValues: fixture.articles.compactMap { article in
+            article.hasBody ? (article.id, article.body) : nil
+        })
+        try storage.saveContent(bodies, retain: Set(bodies.keys))
+
+        var storedBase = try #require(try storage.load())
+        let storedBodies = storage.loadContent()
+        storedBase.articles = storedBase.articles.map { article in
+            guard let body = storedBodies[article.id] else { return article }
+            var article = article
+            article.bodyParagraphs = body.bodyParagraphs
+            article.contentHTML = body.contentHTML
+            return article
+        }
+        let materialized = DeviceStateDocument.materialize(
+            base: storedBase,
+            shards: try storage.loadShards()
+        )
+        let store = ReaderStore._makeForTesting()
+        store.feeds = materialized.feeds
+        store.articles = materialized.articles
+
+        for index in fixture.feeds.indices {
+            let feed = fixture.feeds[index]
+            let parsed = try Self.parsedFeed(
+                feed: feed, index: index, current: fixture.byFeed[index], variant: "none"
+            )
+            let before = store.articles
+            let existingByID = Dictionary(uniqueKeysWithValues: before.map { ($0.id, $0) })
+            for var article in parsed.articles {
+                let existing = try #require(existingByID[article.id])
+                article.isRead = existing.isRead
+                article.isStarred = existing.isStarred
+                article.categories = existing.categories
+                if !article.hasExplicitPublishDate { article.publishedAt = existing.publishedAt }
+                #expect(article == existing, "feed \(feed.id) changed \(article.id)")
+            }
+            store._mergeForTesting(parsed)
+            #expect(store.articles == before, "feed \(feed.id) published a no-op merge")
+        }
+
+        let libraryIDs = Set(materialized.articles.map(\.id))
         for index in [0, 29, 30, Self.feedCount - 2, Self.feedCount - 1] {
             let feed = fixture.feeds[index]
-            func parsedIDs(_ variant: String) throws -> [String] {
-                let xml = Self.feedXML(feed: feed, index: index, current: fixture.byFeed[index], variant: variant)
-                let parsed = try FeedXMLParser(feedURL: feed.feedURL).parse(data: Data(xml.utf8))
-                // Mirrors ReaderStore's re-key of "<feedURL>#<guid>" onto the
-                // library feed id during refresh.
-                let prefix = parsed.feed.id + "#"
-                return parsed.articles.map { article in
-                    #expect(article.id.hasPrefix(prefix))
-                    return Self.articleID(feedID: feed.id, guid: String(article.id.dropFirst(prefix.count)))
-                }
-            }
-            let none = try parsedIDs("none")
-            #expect(none.count == min(Self.feedWindow, fixture.byFeed[index].count))
-            #expect(none.filter { !libraryIDs.contains($0) }.isEmpty, "feed \(feed.id) has new ids in none")
-            let trickleNew = try parsedIDs("trickle").filter { !libraryIDs.contains($0) }
-            #expect(trickleNew.count == (index < 30 ? 1 : 0))
-            let big1New = try parsedIDs("big1").filter { !libraryIDs.contains($0) }
-            #expect(big1New.count == (feed.id == "perf-feed-big" ? 3 : 0))
+            let trickle = try Self.parsedFeed(
+                feed: feed, index: index, current: fixture.byFeed[index], variant: "trickle"
+            )
+            #expect(trickle.articles.count { !libraryIDs.contains($0.id) } == (index < 30 ? 1 : 0))
+            let big1 = try Self.parsedFeed(
+                feed: feed, index: index, current: fixture.byFeed[index], variant: "big1"
+            )
+            #expect(big1.articles.count { !libraryIDs.contains($0.id) } == (feed.id == "perf-feed-big" ? 3 : 0))
         }
+    }
+
+    private static var categories: [ArticleCategory] {
+        (1...8).map { index in
+            ArticleCategory(
+                id: "perf-cat-\(index)",
+                name: "Perf Category \(index)",
+                colorHex: ArticleCategory.defaultPalette[(index - 1) % ArticleCategory.defaultPalette.count],
+                order: index - 1,
+                keywords: ["perf-cat-\(index)"]
+            )
+        }
+    }
+
+    private static func makeStateShard(
+        feeds: [Feed], folders: [String], articles: [Article], categories: [ArticleCategory]
+    ) -> DeviceStateDocument {
+        var shard = DeviceStateDocument(deviceID: deviceID, clock: .zero, updatedAt: referenceDate)
+        var clock = HLC(physicalMillis: 1_759_276_800_000, counter: 0, node: deviceID)
+        func tick() -> HLC { clock.counter &+= 1; return clock }
+        for folder in folders { shard.setFolderPresent(folder, true, hlc: tick()) }
+        for category in categories { shard.setCategory(category.id, category, hlc: tick()) }
+        for feed in feeds {
+            shard.setFeedCategory(feed.id, feed.category, hlc: tick())
+            shard.setFeedSeed(feed.id, FeedSeed(from: feed), hlc: tick())
+        }
+        for (index, article) in articles.enumerated() {
+            shard.setArticleRead(article.id, index % 5 >= 3, hlc: tick())
+            shard.setArticleStarred(article.id, index % 50 == 0, hlc: tick())
+            shard.setArticleCategories(article.id, ["perf-cat-\((index % 8) + 1)"], hlc: tick())
+        }
+        shard.clock = clock
+        shard.generation = 1
+        return shard
+    }
+
+    private static func parsedFeed(
+        feed: Feed, index: Int, current: [Article], variant: String
+    ) throws -> ParsedFeed {
+        let xml = feedXML(feed: feed, index: index, current: current, variant: variant)
+        var parsed = try FeedXMLParser(feedURL: feed.feedURL).parse(data: Data(xml.utf8))
+        let oldPrefix = parsed.feed.id + "#"
+        parsed.feed.id = feed.id
+        parsed.articles = parsed.articles.map { article in
+            var article = article
+            let seed = article.id.hasPrefix(oldPrefix)
+                ? String(article.id.dropFirst(oldPrefix.count)) : article.id
+            article.id = articleID(feedID: feed.id, guid: seed)
+            article.feedID = feed.id
+            return article
+        }
+        return parsed
     }
 
     private static func feedID(_ index: Int) -> String {

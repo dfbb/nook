@@ -85,6 +85,14 @@ done
 [[ "$server_ready" -eq 1 ]] || { echo "feed server did not become ready; see $server_log" >&2; exit 1; }
 
 sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  sha="${sha}-dirty"
+fi
+head_time="$(git -C "$repo_root" log -1 --format=%ct 2>/dev/null || echo 0)"
+binary_time="$(stat -f %m "$executable" 2>/dev/null || echo 0)"
+if [[ "$head_time" =~ ^[0-9]+$ && "$binary_time" =~ ^[0-9]+$ && "$binary_time" -lt "$head_time" ]]; then
+  echo "warning: Nook binary is older than HEAD; rebuild before trusting sha=$sha" >&2
+fi
 launch_args=(
   -NookPerfLibrary "$working"
   -NookPerfScript "$(cd "$(dirname "$script_arg")" && pwd)/$(basename "$script_arg")"
@@ -98,22 +106,28 @@ launch_args=(
 )
 
 # MainThreadLog appends to NSTemporaryDirectory()/ui-forensics.log: the user
-# temp dir for an unsandboxed (CODE_SIGNING_ALLOWED=NO) build, the app
-# container's tmp for a signed one. Only these paths are checked, never other
-# apps' containers.
+# temp dir for an unsigned (CODE_SIGNING_ALLOWED=NO) build. The real app
+# container is considered only for a verifiably signed build, avoiding a TCC
+# prompt and the user's own debug log during normal perf runs.
 candidates=()
-for dir in "${TMPDIR:-}" "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)" "$HOME/Library/Containers/com.tim.nook/Data/tmp"; do
+for dir in "${TMPDIR:-}" "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"; do
   [[ -n "$dir" ]] || continue
   path="${dir%/}/ui-forensics.log"
   for seen in ${candidates[@]+"${candidates[@]}"}; do [[ "$seen" -ef "$path" || "$seen" == "$path" ]] && continue 2; done
   candidates+=("$path")
 done
+if codesign --verify "$app" >/dev/null 2>&1; then
+  container_log="$HOME/Library/Containers/com.tim.nook/Data/tmp/ui-forensics.log"
+  candidates+=("$container_log")
+fi
 # Archive any earlier log so the file after this launch holds only this run.
 archive="$repo_root/perf-runs/.work/$label/archived-logs"
 for candidate in "${candidates[@]}"; do
   if [[ -f "$candidate" ]]; then
     mkdir -p "$archive"
-    mv "$candidate" "$archive/$(date +%Y%m%d-%H%M%S)-$RANDOM-ui-forensics.log"
+    archived="$archive/$(date +%Y%m%d-%H%M%S)-$RANDOM-ui-forensics.log"
+    mv "$candidate" "$archived"
+    echo "archived existing perf log: $candidate -> $archived" >&2
   fi
 done
 
