@@ -21,8 +21,11 @@ import ObjectiveC
 /// classifyAll/wait/noop. Optional action fields are `target`, `ids`, `value`,
 /// `index`, `count`, `rate`, and `duration` (seconds). `coldFirst` adds a rep 0
 /// recorded as `cold=1`; set it only on the step that really runs first after
-/// launch. An unresolvable target or a missing list logs `perf.driver.error`,
-/// which makes the run invalid.
+/// launch. The first step that runs (after any `-NookPerfOnly` filter) and does
+/// not state `coldFirst` gets a rep 0 marked `cold=1 warmup=1`, which perfreport
+/// leaves out of the warm medians; `"coldFirst": false` keeps a one-rep-per-launch
+/// script's only rep. An unresolvable target or a missing list logs
+/// `perf.driver.error`, which makes the run invalid.
 @MainActor
 final class PerfDriver {
     static let shared = PerfDriver()
@@ -67,11 +70,13 @@ final class PerfDriver {
             }
             try await fixLayout()
             let adapter = PerfStoreAdapter(store: store)
-            for step in steps {
+            for (position, step) in steps.enumerated() {
                 let repetitions = max(1, step.repetitions ?? script.repetitions ?? 5)
-                let includesCold = step.coldFirst ?? script.coldFirst ?? false
-                if includesCold {
-                    try await run(step: step, rep: 0, cold: true, adapter: adapter)
+                let stated = step.coldFirst ?? script.coldFirst
+                // The first rep after launch is cold whatever the step is.
+                let warmup = position == 0 && stated == nil
+                if stated == true || warmup {
+                    try await run(step: step, rep: 0, cold: true, warmup: warmup, adapter: adapter)
                 }
                 for rep in 1...repetitions {
                     try await run(step: step, rep: rep, cold: false, adapter: adapter)
@@ -84,10 +89,11 @@ final class PerfDriver {
         NSApp.terminate(nil)
     }
 
-    private func run(step: Step, rep: Int, cold: Bool, adapter: PerfStoreAdapter) async throws {
+    private func run(step: Step, rep: Int, cold: Bool, warmup: Bool = false, adapter: PerfStoreAdapter) async throws {
         for action in step.setup ?? [] { try await perform(action, adapter: adapter) }
         try await settle(adapter: adapter, id: step.id)
         MainThreadLog.scenarioBegin(id: step.id, rep: rep, cold: cold)
+        if warmup { MainThreadLog.scenarioValue("warmup", 1) }
         PerfListScrollTarget.setRecording(true)
         try await perform(step.action, adapter: adapter)
         let activeEnd = try await quiesce(adapter: adapter, id: step.id)
@@ -233,35 +239,54 @@ final class PerfDriver {
     }
 
     /// Posts ↓ (or ⌘↓) to the article table, which is made first responder first
-    /// so the sidebar can never take the keys. Moves are counted from the
-    /// selection's index, and `missedSelection = posted − moved`.
+    /// so the sidebar can never take the keys. Moves are counted on the table's
+    /// own selected row, which is where ↓ moves from, and
+    /// `missedSelection = posted − moved`.
     private func keyRepeat(command: Bool, rate: Double, duration: Double, adapter: PerfStoreAdapter) async throws {
         guard let tableView = PerfListScrollTarget.tableView, let window = tableView.window else {
             MainThreadLog.note("perf.driver.error", extra: "action=keyRepeat reason=no_article_table")
             return
         }
         window.makeFirstResponder(tableView)
+        // Setup's selectIndex moves the store's selection, but the table can keep
+        // the row the previous rep ended on, and ↓ moves from the table's row.
+        // Put the table on the store's row so every rep starts from the same place.
+        if let index = adapter.selectedIndex, index < tableView.numberOfRows {
+            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            tableView.scrollRowToVisible(index)
+        }
+        let startRow = tableView.selectedRow
         let startIndex = adapter.selectedIndex
+        guard startRow >= 0, startRow == startIndex else {
+            MainThreadLog.note("perf.driver.error", extra: "action=keyRepeat reason=table_selection_mismatch row=\(startRow) index=\(startIndex ?? -1)")
+            return
+        }
         let repeats = max(1, Int(rate * duration))
         let posting = await PerfKeyPoster.post(
             count: repeats, rate: rate, command: command, windowNumber: window.windowNumber,
             sink: PerfKeyEventSink(application: NSApp))
         // Let the queued events drain: the selection must hold still for 1s (up
         // to 15s) before it is read.
-        var last = adapter.selectedIndex
+        var last = tableView.selectedRow
         var stableSince = ProcessInfo.processInfo.systemUptime
         let drainDeadline = stableSince + 15
         while ProcessInfo.processInfo.systemUptime - stableSince < 1, ProcessInfo.processInfo.systemUptime < drainDeadline {
             try await Task.sleep(for: .milliseconds(100))
-            if adapter.selectedIndex != last { last = adapter.selectedIndex; stableSince = ProcessInfo.processInfo.systemUptime }
+            if tableView.selectedRow != last { last = tableView.selectedRow; stableSince = ProcessInfo.processInfo.systemUptime }
         }
-        let moved = max(0, (adapter.selectedIndex ?? 0) - (startIndex ?? 0))
+        let moved = tableView.selectedRow - startRow
+        let storeMoved = (adapter.selectedIndex ?? startRow) - startRow
+        // Each ↓ moves at most one row, so moving more than was posted means the
+        // count started from the wrong row; that rep cannot say what was missed.
+        if moved < 0 || moved > repeats {
+            MainThreadLog.note("perf.driver.error", extra: "action=keyRepeat reason=moved_out_of_range posted=\(repeats) moved=\(moved)")
+        }
         MainThreadLog.scenarioValue("keysPosted", repeats)
         MainThreadLog.scenarioValue("keysMoved", moved)
         MainThreadLog.scenarioValue("missedSelection", repeats - moved)
         MainThreadLog.note(
             "perf.keys",
-            extra: "posted=\(posting.count) moved=\(moved) responder=\(window.firstResponder === tableView ? "table" : "other") keysPostedOverMs=\(posting.overMs.rounded()) achievedHz=\(posting.hz.rounded(toPlaces: 2))")
+            extra: "posted=\(posting.count) moved=\(moved) storeMoved=\(storeMoved) startRow=\(startRow) responder=\(window.firstResponder === tableView ? "table" : "other") keysPostedOverMs=\(posting.overMs.rounded()) achievedHz=\(posting.hz.rounded(toPlaces: 2))")
     }
 
     private var displayHz: Double { Double(NSScreen.main?.maximumFramesPerSecond ?? 60) }

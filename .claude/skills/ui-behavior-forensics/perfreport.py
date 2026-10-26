@@ -78,7 +78,7 @@ TOGGLE_COUNTS = {"D2": 20, "D3": 20, "D4": 1, "D5": 20}
 VARIANTS = ("none", "trickle", "burst", "big1")
 LOG_NAME = re.compile(r"-(?P<variant>none|trickle|burst|big1)-\d+\.log$")
 SCENARIO_BEGIN = re.compile(r"\bscenario\.begin\s+(?P<fields>.*)$")
-NON_METRICS = {"frames", "rep", "cold", "toggles", "dur", "activeDur", "sel"}
+NON_METRICS = {"frames", "rep", "cold", "toggles", "dur", "activeDur", "sel", "warmup"}
 # measurement.md §4: a run (driver.error) or rep (timeouts) that logged one of
 # these is invalid. PerfDriver logs settle.timeout before the rep's
 # scenario.begin and quiesce.timeout before its stats, both with id=; the
@@ -351,6 +351,9 @@ def parse_text(text: str, path: str = "<sample>") -> tuple[list[Record], list[st
         values = {key: parsed_value for key, value in parsed.items() if (parsed_value := number(value)) is not None}
         derived(scenario, values)
         invalid = ("perf.driver.error" if file_error else "") or tainted_ids.pop(scenario, "") or tainted_next
+        # PerfDriver's cold first-after-launch rep of a step that is not A1: it
+        # belongs in neither the warm medians nor A1's cold gate.
+        invalid = invalid or ("warmup" if parsed.get("warmup") == "1" else "")
         tainted_next = ""
         records.append(Record(scenario, library, variant, cold, values, raw, path, window, invalid))
         window = []
@@ -678,6 +681,19 @@ def selftest() -> None:
     assert all(r.variant == "trickle" for r in next_records)
     false_cold, _ = parse_text("1 scenario.stats id=A2 rep=0 cold=1 ttfr=50")
     assert len(false_cold) == 1 and not false_cold[0].cold
+    # A warmup rep (the first after launch of a non-A1 step) is in no median.
+    warmup, _ = parse_text("1 scenario.stats id=A2 rep=0 cold=1 ttfr=900 warmup=1\n"
+                           "2 scenario.stats id=A2 rep=1 cold=0 ttfr=50")
+    assert [r.invalid for r in warmup] == ["warmup", ""], warmup
+    assert metric(summarize(warmup), "A2", "unknown", "none", "ttfr") == {"median": 50, "worst": 50, "n": 1}
+
+    # Opt levels: -O and -Onone are never summarized or compared together.
+    fast, slow, legacy = ("0 run.begin lib=lib-10k hz=60 opt=-O", "0 run.begin lib=lib-10k hz=60 opt=-Onone",
+                          "0 run.begin lib=lib-10k hz=60")
+    assert opt_levels([fast, slow, legacy]) == {"-O", "-Onone", "unknown"}
+    assert opt_mismatch({"before": {"-O"}, "after": {"-O", "unknown"}}) == ""
+    assert "differ" in opt_mismatch({"before": {"-Onone"}, "after": {"-O"}})
+    assert "mixes" in opt_mismatch({"run": {"-O", "-Onone"}})
 
     # Invalid reps: timeouts drop their rep, driver.error drops the file.
     invalid_records, _ = parse_text(SELF_INVALID, "perf-runs/after/lib-10k-switch-none-2.log")
@@ -764,6 +780,13 @@ def selftest() -> None:
         assert exit_code(str(failing)) == 0
         assert exit_code(str(passing), "--strict") == 0
         assert exit_code("--compare", str(passing), str(failing), "--strict") == 1
+        for level in ("-O", "-Onone"):
+            pathlib.Path(directory, f"opt{level}.log").write_text(
+                f"0 run.begin lib=lib-10k opt={level}\n1 scenario.stats id=A2 rep=1 cold=0 worstStall=10\n")
+        assert exit_code("--compare", str(pathlib.Path(directory, "opt-O.log")),
+                         str(pathlib.Path(directory, "opt-O.log"))) == 0
+        assert exit_code("--compare", str(pathlib.Path(directory, "opt-Onone.log")),
+                         str(pathlib.Path(directory, "opt-O.log"))) == 1
         # Cold ttfr is gated on A1/10k only; other libs show it without a verdict.
         empty = pathlib.Path(directory, "empty", "lib-10k-switch-none-1.log")
         empty.parent.mkdir()
@@ -783,6 +806,38 @@ def selftest() -> None:
             assert exit_code(str(scoped), "--strict") == 0
     print("perfreport selftest: PASS")
     print(report)
+
+
+def opt_levels(runs: list[str]) -> set[str]:
+    """The optimization levels run.begin declared; "unknown" for builds that predate opt=."""
+    return {fields(BEGIN.search(raw)["fields"]).get("opt", "unknown") for raw in runs if BEGIN.search(raw)}
+
+
+def opt_mismatch(sides: dict[str, set[str]]) -> str:
+    """Why these runs must not be summarized or compared together, or "" when they may.
+
+    -Onone inflates app-code cost several times over, so a median or a delta that
+    mixes it with -O measures the build, not the change. Logs without opt= are let
+    through (with a warning from the caller), since nothing says they differ.
+    """
+    known = {name: levels - {"unknown"} for name, levels in sides.items()}
+    for name, levels in known.items():
+        if len(levels) > 1:
+            return f"{name} mixes opt levels {sorted(levels)}"
+    distinct = {level for levels in known.values() for level in levels}
+    if len(distinct) > 1:
+        return "opt levels differ: " + ", ".join(f"{name}={sorted(levels)}" for name, levels in known.items())
+    return ""
+
+
+def check_opt(sides: dict[str, list[str]]) -> None:
+    levels = {name: opt_levels(runs) for name, runs in sides.items()}
+    reason = opt_mismatch(levels)
+    if reason:
+        sys.exit(f"refusing to report: {reason} (rebuild with make perf-build and rerun)")
+    if any("unknown" in found for found in levels.values()):
+        print("warning: some runs do not log opt= (built before it was recorded); "
+              "their optimization level is unchecked", file=sys.stderr)
 
 
 def resolve(value: str) -> pathlib.Path:
@@ -806,6 +861,7 @@ def main() -> None:
     if args.compare:
         before_records, before_runs = load(resolve(args.compare[0]))
         after_records, after_runs = load(resolve(args.compare[1]))
+        check_opt({"before": before_runs, "after": after_runs})
         before, after = summarize(before_records), summarize(after_records)
         drops = (dropped(before_records), dropped(after_records))
         failures = gate_failures(after)
@@ -818,6 +874,7 @@ def main() -> None:
     if not args.path:
         parser.error("path is required unless --compare or --selftest is used")
     records, runs = load(resolve(args.path))
+    check_opt({"run": runs})
     if args.trail:
         text = trail(records, args.trail)
         if not text:

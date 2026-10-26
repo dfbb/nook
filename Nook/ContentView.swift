@@ -1533,12 +1533,24 @@ enum PerfListScrollTarget {
         }
     }
 
-    private static func armFrameFallback(for generation: Int) {
+    /// A running link that stays silent this many 250ms checks (5s) has stopped
+    /// delivering — an occluded window, a sleeping display — without pausing.
+    private static let stalledLinkChecks = 20
+
+    private static func armFrameFallback(for generation: Int, checks: Int = 1) {
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard frameGeneration == generation else { return }
             if let link = probe?.link, !link.isPaused {
-                armFrameFallback(for: generation)
+                guard checks >= stalledLinkChecks else {
+                    armFrameFallback(for: generation, checks: checks + 1)
+                    return
+                }
+                // Nothing will resume the driver, and run.sh waits on the app
+                // with `open -W`, so end the run as invalid instead of hanging.
+                MainThreadLog.note("perf.driver.error", extra: "reason=displaylink-stalled waitedMs=\(checks * 250)")
+                MainThreadLog.flush()
+                NSApp.terminate(nil)
                 return
             }
             MainThreadLog.note("perf.frame.timeout")

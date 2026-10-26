@@ -35,7 +35,7 @@
 **① 시나리오 마커와 통계** (`MainThreadLog`에 추가)
 - `scenarioBegin(name:)`은 `totals` 스냅샷, stall 목록 길이, 프레임 카운터를 저장합니다.
 - `scenarioEnd()`는 그 차이를 한 줄로 기록합니다(줄 형식은 4절).
-- 시작할 때 한 번 `run.begin label=<NookPerfLabel> sha=<git> lib=<id> log=<MainThreadLog.url> hz=<display Hz>`를 남깁니다.
+- 시작할 때 한 번 `run.begin label=<NookPerfLabel> sha=<git> lib=<id> hz=<display Hz> opt=<-O|-Onone> log=<MainThreadLog.url>`를 남깁니다. `opt`는 컴파일 시점에 정해지는 `_isDebugAssertConfiguration()`에서 옵니다.
 - 로그 경로는 서명/샌드박스 여부에 따라 바뀝니다. `CODE_SIGNING_ALLOWED=NO` 빌드는 entitlement가 없어 컨테이너 밖 `$TMPDIR`에 씁니다. 그래서 경로를 추측하지 말고 로그에 찍힌 `log=` 값을 씁니다.
 
 **② Watchdog을 촘촘하게**
@@ -121,10 +121,10 @@ NOOK_GEN_PERF_LIB=$PERF/golden/lib-10k NOOK_GEN_N=10000 swift test --package-pat
 ## 3. 자동화: 앱 안에서 도는 스크립트 드라이버
 
 `Nook/PerfDriver.swift`(`#if DEBUG`, `@MainActor`)를 둡니다. `-NookPerfScript <json>`을 받으면 라이브러리 로드가 끝난 뒤 단계를 차례로 실행하고, 끝나면 `MainThreadLog.flush()`를 부르고 `NSApp.terminate`합니다.
-- 한 단계만 별도 실행할 때는 `-NookPerfOnly B3`를 더합니다. 쉼표로 여러 ID를 지정할 수도 있습니다. P0-B의 `run-all.sh`는 각 refresh 단계만 담은 JSON을 파생해 단계·반복마다 별도 실행하므로 이 필터 없이도 B2/B3/B5가 서로 오염되지 않습니다.
+- 한 단계만 별도 실행할 때는 `tools/perf/run.sh --only B3 …`처럼 `--only`를 주면 `-NookPerfOnly B3`로 넘어갑니다. 쉼표로 여러 ID를 지정할 수도 있습니다. `run-all.sh`는 refresh 단계(B 전부, `trickle`의 C4/E3)를 그룹 JSON에서 반복 1회·`coldFirst:false`로 파생한 스크립트와 `--only <ID>`로 단계·반복마다 별도 실행하므로 B2/B3/B5가 서로 오염되지 않습니다.
 - 드라이버는 공개 API를 **어댑터 한 겹**을 거쳐 호출합니다: `selectSmartSource`, `feedSelection`, 카테고리 선택, `refreshAll()`, `refresh(feedID:)`, `refreshOnActivation(honorThrottle:false)`, `setRead`, `toggleStarred`, `selectedArticleID`. 그래서 Phase 사이에 이름이 바뀌어도 고칠 곳은 어댑터뿐입니다.
 - 모든 단계의 형태는 같습니다: `settle`(2초 동안 stall 0, `isRefreshing == false`) → `scenarioBegin` → 동작 → `quiesce`(1.5초 동안 publish·settle·stall 0 + refresh 끝, 최대 180초) → `scenarioEnd`.
-- 시나리오마다 5회 반복합니다. **cold**(실행 직후 첫 전환)는 A1에만 `coldFirst:true`로 rep 0을 붙여 따로 1회 기록합니다(`cold=1`). 다른 단계의 rep은 모두 warm입니다.
+- 시나리오마다 5회 반복합니다. **cold**(실행 직후 첫 전환)는 A1에만 `coldFirst:true`로 rep 0을 붙여 따로 1회 기록합니다(`cold=1`). 실행 후 처음 도는 단계가 `coldFirst`를 적지 않았다면(예: `scroll.json`의 C1, `--only A2`) 드라이버가 rep 0을 `cold=1`로 더 돌리고 stats에 `warmup=1`을 붙입니다. perfreport는 이 rep을 warm 중앙값에서도, A1의 cold 기준에서도 빼고 `warmup`으로 셉니다. 실행당 1회가 표본인 파생 스크립트는 `coldFirst:false`를 적어 이 rep을 붙이지 않습니다. 그 밖의 rep은 모두 warm입니다.
 - 창은 드라이버가 1440×900으로 고정하고, split view의 사이드바 270pt·목록 420pt도 고정합니다(`perf.layout listWidth=…`로 확인). 행 수 = 보이는 높이이기 때문입니다. 창 frame/divider autosave는 끄고 시작하므로 앱 defaults에 1440×900이 저장되지 않습니다.
 - `quiesce`는 새로고침·publish·list/reader settle·stall이 1.5초 동안 없을 때 끝나고, 마지막 활동 시각을 시나리오의 활성 구간 끝으로 넘깁니다. 180초(300개 피드 ambient 새로고침이 동시 2개로 ~64초 걸리므로) 안에 조용해지지 않으면 `perf.quiesce.timeout id=…`(settle이면 `perf.settle.timeout`)을 남기며, 그 rep은 버립니다.
 - 대상(피드/폴더/카테고리/행 index)을 찾지 못하거나 목록 스크롤 뷰가 없으면 `perf.driver.error …`를 남깁니다. 이 줄이 있는 실행은 무효입니다. 카테고리는 `"1"`/`"perf-cat-1"` 모두 id `perf-cat-1`로 찾습니다.
@@ -155,10 +155,10 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 
 **C. 스크롤** (All, `lib-10k`/`lib-20k`)
 
-드라이버가 목록 스크롤 뷰의 clip view를 **display-link 콜백마다 한 번씩** 움직입니다(probe의 콜백이 드라이버의 continuation을 깨웁니다). 타이머 slack과 무관하게 vsync당 이동이 정확히 1회이므로 결정적입니다. 250ms fallback은 링크가 살아 있고 재생 중이면 다시 무장하며, 링크가 없거나 일시 정지된 경우에만 `perf.frame.timeout`을 남기고 진행합니다. 따라서 측정 대상인 긴 메인 스레드 stall 자체가 실행을 무효화하지 않습니다.
+드라이버가 목록 스크롤 뷰의 clip view를 **display-link 콜백마다 한 번씩** 움직입니다(probe의 콜백이 드라이버의 continuation을 깨웁니다). 타이머 slack과 무관하게 vsync당 이동이 정확히 1회이므로 결정적입니다. 250ms fallback은 링크가 살아 있고 재생 중이면 다시 무장하며, 링크가 없거나 일시 정지된 경우에만 `perf.frame.timeout`을 남기고 진행합니다. 재생 중인 링크가 연속 20번(5초) 콜백을 주지 않으면(창이 가려지거나 디스플레이가 잠든 경우) `perf.driver.error reason=displaylink-stalled`를 남기고 앱을 종료하므로, `open -W`로 기다리는 run.sh가 멈추지 않습니다. 따라서 측정 대상인 긴 메인 스레드 stall 자체가 실행을 무효화하지 않습니다.
 - C1 fling: 맨 위에서 시작해 초기 속도 6000pt/s, 프레임당 감쇠 0.95로 8회 연속
 - C2 스크롤바 드래그: 1초 동안 30단계로 끝까지, 그다음 `scrollToEndOfDocument` 즉시 점프 1회
-- C3 키 반복: 먼저 목록 `NSTableView`를 first responder로 만듭니다(사이드바가 키를 가져가 피드 선택을 바꾸지 않게). 그다음 메인 액터와 독립된 wall-clock dispatch timer가 `NSApp.postEvent`로 ↓ keyDown/keyUp 쌍을 30Hz로 5초간 보냅니다(`postEvent`는 서브스레드에서 호출할 수 있고, List의 네이티브 선택을 이동시키며 첫 keyDown만 `isARepeat=false`). ⌘↓(Next Article, 리더를 엶)는 `target:"commandDown"`으로 같은 방식입니다. 앱에 j/k 단축키는 없으므로 ↓와 ⌘↓를 씁니다. 끝나면 선택이 1초간 멈출 때까지 기다린 뒤 선택 index 변화로 이동 수를 세어 `perf.keys posted=N moved=M responder=table keysPostedOverMs=… achievedHz=…`와 stats의 `missedSelection = N − M`을 남깁니다.
+- C3 키 반복: 먼저 목록 `NSTableView`를 first responder로 만듭니다(사이드바가 키를 가져가 피드 선택을 바꾸지 않게). 그다음 메인 액터와 독립된 wall-clock dispatch timer가 `NSApp.postEvent`로 ↓ keyDown/keyUp 쌍을 30Hz로 5초간 보냅니다(`postEvent`는 서브스레드에서 호출할 수 있고, List의 네이티브 선택을 이동시키며 첫 keyDown만 `isARepeat=false`). ⌘↓(Next Article, 리더를 엶)는 `target:"commandDown"`으로 같은 방식입니다. 앱에 j/k 단축키는 없으므로 ↓와 ⌘↓를 씁니다. 보내기 전에 테이블의 선택 행을 store의 선택 index(setup의 `selectIndex 0`)로 맞춥니다. ↓는 테이블 자신의 선택 행에서 움직이므로, 이걸 하지 않으면 이전 rep이 끝난 행에서 시작해 `moved`가 `posted`를 넘었습니다. 끝나면 테이블 선택이 1초간 멈출 때까지 기다린 뒤 **테이블 선택 행**의 변화로 이동 수를 세어 `perf.keys posted=N moved=M storeMoved=… startRow=… responder=table keysPostedOverMs=… achievedHz=…`와 stats의 `missedSelection = N − M`을 남깁니다. 시작 행이 store와 다르거나 `M`이 0..N 밖이면 `perf.driver.error`로 실행을 무효로 합니다.
 - C4 C1 도중에 B2 시작 (새로고침 중 스크롤)
 - C5 윈도 경계: 1500pt/s 등속으로 150행에서 450행까지 내려가며 200/400 경계를 넘깁니다. 이어서 `lib-20k`에서 끝까지 내립니다(스크롤로만 윈도가 커지는 구간).
 
@@ -173,11 +173,11 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 - D5 ⌘↓ 20회 (열 때마다 읽음 처리)
 
 ### 실행 스크립트
-`tools/perf/run.sh <label> <lib> <script>`가 다음을 순서대로 합니다.
+`tools/perf/run.sh [--only <ID>] <label> <lib> <script>`가 다음을 순서대로 합니다.
 1. rsync로 라이브러리 복원
 2. 피드 서버 실행
-3. `open -n -W DerivedData/Build/Products/Debug/Nook.app --args -NookPerfLibrary … -NookPerfScript … -NookPerfLabel <label> -NookStallMs 50 -autoRefreshEnabled NO`
-4. 로그를 `perf-runs/<label>/<lib>-<script>-<ts>.log`로 옮기기
+3. `open -n -W DerivedData-perf/Build/Products/Debug/Nook.app --args -NookPerfLibrary … -NookPerfScript … -NookPerfLabel <label> -NookStallMs 50 -autoRefreshEnabled NO`
+4. 로그를 `perf-runs/<label>/<lib>-<script>[-<ID>]-<variant>-<n>.log`로 옮기고, `run.begin opt=`가 `-O`인지 확인하기
 
 로그는 append 방식이므로 실행마다 파일을 옮겨 **실행 단위로 분리**합니다. 시간 간격으로 실행을 가르는 방식에는 의존하지 않습니다.
 
@@ -185,14 +185,14 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 - 같은 머신, 전원 연결, 다른 앱 종료, Low Power 꺼짐
 - 실행 전 `pmset -g therm`이 정상인지 확인
 - 디스플레이 Hz를 `run.begin`에 기록합니다. ProMotion이면 120Hz와 60Hz를 섞어서 비교하지 않습니다.
-- before와 after는 모두 `make perf-build`로 빌드하고 같은 서명 여부로 측정합니다. 이 타깃은 DEBUG 계측을 유지하면서 Swift 앱 코드를 `-O`로 최적화하므로, `-Onone`이 대형 SwiftUI 목록 비용을 과장해 비교 실행을 수십 초씩 늘리는 문제를 피합니다.
+- before와 after는 모두 `make perf-build`로 빌드하고 같은 서명 여부로 측정합니다. 이 타깃은 DEBUG 계측을 유지하면서 Swift 앱 코드를 `-O`로 최적화하므로, `-Onone`이 대형 SwiftUI 목록 비용을 과장해 비교 실행을 수십 초씩 늘리는 문제를 피합니다. 결과물은 `DerivedData-perf/`에 따로 쌓이므로 `make build`(`-Onone`, `DerivedData/`)가 덮어쓰지 않고, run.sh는 기본으로 이 앱을 띄웁니다. 실행 로그의 `run.begin opt=`가 `-O`가 아니면 run.sh는 경고와 함께 실패하고(`NOOK_PERF_ALLOW_ONONE=1`로만 통과), perfreport는 opt가 섞인 실행을 요약하거나 비교하지 않습니다.
 
 ---
 
 ## 4. 로그 형식과 집계
 
 ```
-<t> run.begin        label=before-ebd5ee6 sha=ebd5ee6 lib=lib-10k hz=120 log=/…/ui-forensics.log
+<t> run.begin        label=before-ebd5ee6 sha=ebd5ee6 lib=lib-10k hz=120 opt=-O log=/…/ui-forensics.log
 <t> perf.replica     dir=/…/lib-10k/.nook-perf-replica/
 <t> perf.library     articles=10000 unread=6000 starred=200 feeds=300
 <t> perf.layout      window=1440x900 listWidth=420 columns=0+270,0+691,692+748
@@ -286,7 +286,7 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 이 머신에서 확인한 사양은 xctrace 16.0입니다. 템플릿은 `Time Profiler`, `Hangs`, `Animation Hitches`, `SwiftUI`, `System Trace`가 있고, instrument는 `Hitches`, `Hangs`, `os_signpost`, `Core Animation Commits`가 있습니다.
 
 ```sh
-APP=DerivedData/Build/Products/Debug/Nook.app/Contents/MacOS/Nook
+APP=DerivedData-perf/Build/Products/Debug/Nook.app/Contents/MacOS/Nook
 xcrun xctrace record --template 'Animation Hitches' --time-limit 60s \
   --output perf-runs/after-p2/C1.trace \
   --launch -- "$APP" -NookPerfLibrary … -NookPerfScript scroll.json -NookPerfLabel after-p2
@@ -318,7 +318,7 @@ xcrun xctrace export --input … --xpath '/trace-toc/run[@number="1"]/data/table
 | C5 | 20k | growMaxMs · stalls≥100 | – | – | – | ≤8 · 0 | – |
 | D2 | 10k | toggle ms · rowcontent/toggle | – | – | – | ≤16 · ≤5 | – |
 
-표 아래에는 `run.begin` 줄(label, sha, hz)과 실행 횟수를 붙이고, 인과 근거로 `--trail` 원본 1건을 붙입니다.
+표 아래에는 `run.begin` 줄(label, sha, hz, opt)과 실행 횟수를 붙이고, 인과 근거로 `--trail` 원본 1건을 붙입니다.
 
 ---
 

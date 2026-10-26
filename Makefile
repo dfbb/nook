@@ -19,9 +19,13 @@ PLUGIN_FLAGS := -skipPackagePluginValidation
 build:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DESTINATION)' -derivedDataPath $(DERIVED_DATA_PATH) $(PLUGIN_FLAGS) $(BUILD_FLAGS) build
 
-# Keep DEBUG instrumentation while measuring optimized application code.
+# Keep DEBUG instrumentation while measuring optimized application code. It
+# builds into its own derived data so `make build` (-Onone) never replaces the
+# app tools/perf/run.sh launches.
+PERF_DERIVED_DATA_PATH := DerivedData-perf
+
 perf-build:
-	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DESTINATION)' -derivedDataPath $(DERIVED_DATA_PATH) $(PLUGIN_FLAGS) $(BUILD_FLAGS) SWIFT_OPTIMIZATION_LEVEL=-O build
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DESTINATION)' -derivedDataPath $(PERF_DERIVED_DATA_PATH) $(PLUGIN_FLAGS) $(BUILD_FLAGS) SWIFT_OPTIMIZATION_LEVEL=-O build
 
 clean:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -derivedDataPath $(DERIVED_DATA_PATH) clean

@@ -44,8 +44,9 @@ fi
 [[ ${#refresh_scripts[@]} -eq 3 || -f "$script_dir/refresh.json" ]] || { echo "missing $script_dir/refresh-{none,trickle,big1}.json (or legacy refresh.json)" >&2; exit 1; }
 mkdir -p "$derived_dir"
 
-# Writes a copy of <group>.json holding only the given step ids (or every step
-# except them with --except). --single also forces one warm repetition.
+# Writes a copy of <group>.json. Mode except drops the given step ids; mode
+# single keeps every step and forces one repetition with no cold rep, and
+# run.sh --only then picks the step.
 derive() {
   local group="$1" name="$2" mode="$3"
   shift 3
@@ -53,7 +54,7 @@ derive() {
 import json, sys
 source, target, mode, *ids = sys.argv[1:]
 script = json.load(open(source))
-keep = (lambda step: step["id"] not in ids) if mode == "except" else (lambda step: step["id"] in ids)
+keep = (lambda step: step["id"] not in ids) if mode == "except" else (lambda step: True)
 script["steps"] = [step for step in script["steps"] if keep(step)]
 missing = set(ids) - {step["id"] for step in json.load(open(source))["steps"]}
 if missing:
@@ -73,14 +74,22 @@ run() {
   "$runner" ${xctrace[@]+"${xctrace[@]}"} "$label" "$@"
 }
 
+run_only() {
+  local step="$1"
+  shift
+  "$runner" ${xctrace[@]+"${xctrace[@]}"} --only "$step" "$label" "$@"
+}
+
 # Refresh-driven steps consume their new items on the first rep, so each rep
 # is its own launch; run.sh restores the golden library before every launch.
-# The log file name carries <step>-<variant>, which perfreport groups by.
+# The log file name carries <step>-<variant> (run.sh appends the --only id).
+# The one rep is the step's sample by design, so the script states coldFirst
+# false and the driver adds no cold rep before it.
 run_per_rep() {
   local group="$1" step="$2" lib="$3" variant="$4"
   local script
-  script="$(derive "$group" "$group-$step" single "$step")"
-  for _ in $(seq "$reps"); do run "$lib" "$script" "$variant"; done
+  script="$(derive "$group" "$group-single" single)"
+  for _ in $(seq "$reps"); do run_only "$step" "$lib" "$script" "$variant"; done
 }
 
 # Library and variant coverage follows measurement.md §3/§5.

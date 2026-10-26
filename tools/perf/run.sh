@@ -2,24 +2,31 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [--xctrace TEMPLATE] <label> <lib-name-or-path> <script.json> [variant]" >&2
+  echo "usage: $0 [--xctrace TEMPLATE] [--only ID[,ID...]] <label> <lib-name-or-path> <script.json> [variant]" >&2
   exit 2
 }
 
 xctrace_template=""
-if [[ "${1:-}" == "--xctrace" ]]; then
-  [[ $# -ge 3 ]] || usage
-  xctrace_template="$2"
-  shift 2
-fi
+only=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --xctrace) [[ $# -ge 2 ]] || usage; xctrace_template="$2"; shift 2 ;;
+    --only) [[ $# -ge 2 ]] || usage; only="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
 [[ $# -ge 3 && $# -le 4 ]] || usage
+[[ -z "$only" || "$only" =~ ^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$ ]] || { echo "invalid --only (step ids, comma-separated): $only" >&2; exit 2; }
 
 label="$1"
 lib_arg="$2"
 script_arg="$3"
 variant="${4:-none}"
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-app="$repo_root/DerivedData/Build/Products/Debug/Nook.app"
+# `make perf-build` (-O, DEBUG instrumentation kept). NOOK_PERF_APP points
+# elsewhere, e.g. at the -Onone `make build` app, which also needs
+# NOOK_PERF_ALLOW_ONONE=1 to pass the check after the run.
+app="${NOOK_PERF_APP:-$repo_root/DerivedData-perf/Build/Products/Debug/Nook.app}"
 executable="$app/Contents/MacOS/Nook"
 port=8765
 
@@ -34,11 +41,13 @@ else
 fi
 [[ -d "$golden" ]] || { echo "golden library not found: $golden" >&2; exit 1; }
 [[ -f "$script_arg" ]] || { echo "scenario script not found: $script_arg" >&2; exit 1; }
-[[ -d "$app" ]] || { echo "debug app not found: $app (run make build first)" >&2; exit 1; }
+[[ -d "$app" ]] || { echo "perf app not found: $app (run make perf-build first)" >&2; exit 1; }
 
 lib_name="$(basename "$golden")"
 script_name="$(basename "$script_arg")"
 script_name="${script_name%.*}"
+# The log name keeps the step, so per-step launches stay apart in perf-runs/.
+[[ -z "$only" ]] || script_name="$script_name-${only//,/+}"
 data_root="$(cd "$golden/../.." && pwd)"
 # Feed XML is generated per library, so lib-10k never serves lib-20k's items.
 feed_root="$data_root/feeds/$lib_name/$variant"
@@ -91,7 +100,7 @@ fi
 head_time="$(git -C "$repo_root" log -1 --format=%ct 2>/dev/null || echo 0)"
 binary_time="$(stat -f %m "$executable" 2>/dev/null || echo 0)"
 if [[ "$head_time" =~ ^[0-9]+$ && "$binary_time" =~ ^[0-9]+$ && "$binary_time" -lt "$head_time" ]]; then
-  echo "warning: Nook binary is older than HEAD; rebuild before trusting sha=$sha" >&2
+  echo "warning: Nook binary is older than HEAD; run make perf-build before trusting sha=$sha" >&2
 fi
 launch_args=(
   -NookPerfLibrary "$working"
@@ -104,6 +113,7 @@ launch_args=(
   -NookAICategorize NO
   -NookFreezeRelativeTime
 )
+[[ -z "$only" ]] || launch_args+=(-NookPerfOnly "$only")
 
 # MainThreadLog appends to NSTemporaryDirectory()/ui-forensics.log: the user
 # temp dir for an unsigned (CODE_SIGNING_ALLOWED=NO) build. The real app
@@ -161,3 +171,11 @@ done
   exit 1
 }
 echo "$destination"
+
+# -Onone inflates app-code cost several times over; such a log must not pass
+# for a perf-build one. perfreport also refuses to compare across opt levels.
+opt="$(sed -n 's/.*run\.begin.* opt=\([^ ]*\).*/\1/p' "$destination" | tail -1)"
+if [[ "$opt" != "-O" ]]; then
+  echo "warning: this run was built with opt=${opt:-unknown}, not -O; measure with make perf-build" >&2
+  [[ "${NOOK_PERF_ALLOW_ONONE:-0}" == "1" ]] || exit 1
+fi

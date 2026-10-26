@@ -48,9 +48,17 @@ add a localhost development exception before using refresh scenarios.
 
 ## Run
 
-Build first with `make build`. A single run takes a label (`[A-Za-z0-9._-]`,
+Build first with `make perf-build`: DEBUG instrumentation with `-O` app code,
+in its own `DerivedData-perf/` so `make build` (`-Onone`) never replaces it.
+`run.sh` launches that app (`NOOK_PERF_APP` overrides the path). `run.begin`
+logs `opt=-O|-Onone`; after the run, `run.sh` warns and exits 1 on anything
+but `-O` unless `NOOK_PERF_ALLOW_ONONE=1`, and perfreport refuses to summarize
+or compare runs whose opt levels differ.
+
+A single run takes a label (`[A-Za-z0-9._-]`,
 no leading dot), library (a generated name or directory), driver JSON, and
-optional feed variant. Port 8765 must be free; the runner refuses to start
+optional feed variant. `--only ID[,ID]` runs just those steps
+(`-NookPerfOnly`) and adds the ids to the log name. Port 8765 must be free; the runner refuses to start
 next to a stale feed server. It passes `-NookPerfSHA` with the current short
 HEAD plus `-dirty` when tracked changes exist, and warns if the app binary is
 older than HEAD. It archives an earlier `ui-forensics.log` from the process temp
@@ -61,7 +69,13 @@ launch's log as `perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`:
 ```sh
 tools/perf/run.sh before-$(git rev-parse --short HEAD) lib-10k tools/perf/scripts/switch.json none
 tools/perf/run.sh after-p2 lib-10k tools/perf/scripts/refresh-trickle.json trickle
+tools/perf/run.sh --only C3 after-p2 lib-5k tools/perf/scripts/scroll.json none
 ```
+
+The first step a launch runs is cold. Unless it states `coldFirst` (A1 does),
+the driver adds a rep 0 logged `cold=1 warmup=1`, which perfreport leaves out
+of every median (`warmup` in the dropped counts). A script whose one rep per
+launch is the sample states `"coldFirst": false`.
 
 To capture an Instruments trace, put `--xctrace` first:
 
@@ -77,7 +91,9 @@ D → `toggle.json`, E → `misc.json`. A single legacy `refresh.json` is still
 accepted. Refresh-driven steps (all of B, plus C4 and E3 under `trickle`) run
 one launch per step and repetition, five each, because the first refresh
 consumes the new items and the golden library is restored only per launch.
-Derived single-step scripts are written under `perf-runs/.work/<label>/scripts`:
+Each such launch uses a derived copy of the group script (one rep,
+`coldFirst: false`) with `--only <ID>`. Derived scripts are written under
+`perf-runs/.work/<label>/scripts`:
 
 ```sh
 tools/perf/run-all.sh before-$(git rev-parse --short HEAD)

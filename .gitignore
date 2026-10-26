@@ -1,5 +1,6 @@
 # Xcode
 DerivedData/
+DerivedData-perf/
 build/
 *.xcworkspace
 *.xcuserstate
@@ -20,3 +21,4 @@ xcuserdata/
 # Generated performance fixtures and captured runs
 perf-data/
 perf-runs/
+__pycache__/
