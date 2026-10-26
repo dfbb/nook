@@ -18,6 +18,10 @@ public enum PlusOwnFeed {
     /// Records the publication URL, or clears it when passed nothing. Called
     /// wherever the publication becomes known or stops being ours.
     public static func remember(publicationURL: String?) {
+        #if DEBUG
+        // A perf run is never signed in; keep its empty store off the real key.
+        if PerfLaunch.isActive { return }
+        #endif
         let defaults = UserDefaults.standard
         guard let publicationURL, !publicationURL.isEmpty else {
             defaults.removeObject(forKey: publicationURLKey)

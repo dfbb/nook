@@ -65,6 +65,10 @@ public enum LocalAppResetService {
         preservingDeviceID deviceID: String,
         bundleIdentifier: String
     ) async throws {
+        #if DEBUG
+        // A perf run shares the real app's defaults domain and Keychain.
+        if PerfLaunch.isActive { throw CocoaError(.featureUnsupported) }
+        #endif
         let fileManager = FileManager.default
         let paths = try LocalAppResetPaths.current(
             includingLocalLibrary: UserDefaults.standard.bool(forKey: ReaderStore.usesLocalLibraryKey),

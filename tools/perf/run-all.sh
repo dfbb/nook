@@ -132,6 +132,11 @@ group_misc() {
   run_per_rep misc E3 lib-10k trickle
 }
 
+# Ctrl-C reaches run.sh and this script alike: stop the whole matrix, not
+# just the current launch.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 failed=0
 summary="$run_dir/groups.txt"
 for group in switch refresh scroll toggle misc; do
@@ -142,6 +147,10 @@ for group in switch refresh scroll toggle misc; do
     echo "$group: succeeded" | tee -a "$summary"
   else
     status=$?
+    if [[ "$status" -eq 130 || "$status" -eq 143 ]]; then
+      echo "$group: aborted (exit=$status; remaining groups skipped)" | tee -a "$summary" >&2
+      exit "$status"
+    fi
     echo "$group: failed (exit=$status; remaining launches in group skipped)" | tee -a "$summary" >&2
     failed=1
   fi

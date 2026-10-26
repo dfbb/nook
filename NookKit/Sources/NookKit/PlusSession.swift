@@ -37,6 +37,11 @@ public enum PlusCredential {
     public static let configuredKey = "nookPlusSessionConfigured"
 
     public static var current: PlusSession? {
+        #if DEBUG
+        // A perf run is unsigned, so a Keychain read would block launch on an
+        // access prompt; it never needs the user's Plus session anyway.
+        if PerfLaunch.isActive { return nil }
+        #endif
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -57,6 +62,12 @@ public enum PlusCredential {
     /// Stores a session, or clears it when passed nil. Always device-only.
     @discardableResult
     public static func store(_ session: PlusSession?) -> Bool {
+        #if DEBUG
+        // With no session read, any Plus call fails as `.sessionInvalid` and
+        // signs out. Never let that delete the developer's real session or
+        // rewrite its defaults flag.
+        if PerfLaunch.isActive { return false }
+        #endif
         SecItemDelete(baseQuery as CFDictionary)
 
         var stored = false

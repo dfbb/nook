@@ -54,6 +54,10 @@ public enum GeminiCredential {
     private static let account = "apiKey"
 
     public static var apiKey: String? {
+        #if DEBUG
+        // Same as `PlusCredential.current`: keep unsigned perf runs off the Keychain.
+        if PerfLaunch.isActive { return nil }
+        #endif
         var query: [String: Any] = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -71,6 +75,10 @@ public enum GeminiCredential {
     /// write leaves no key and the flag false), never just the input.
     @discardableResult
     public static func setAPIKey(_ key: String?) -> Bool {
+        #if DEBUG
+        // Nor may a perf run write or clear the real key and its defaults flag.
+        if PerfLaunch.isActive { return false }
+        #endif
         SecItemDelete(baseQuery as CFDictionary)
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         var stored = false

@@ -4206,9 +4206,8 @@ public final class ReaderStore {
     private func restoreStorageIfPossible() async {
         do {
             #if DEBUG
-            if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-NookPerfLibrary"),
-               ProcessInfo.processInfo.arguments.indices.contains(index + 1) {
-                let directoryURL = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[index + 1], isDirectory: true)
+            if let path = PerfLaunch.value(for: "-NookPerfLibrary") {
+                let directoryURL = URL(fileURLWithPath: path, isDirectory: true)
                 let storage = ReaderStorage(directoryURL: directoryURL)
                 self.storage = storage
                 syncFolderDisplayPath = directoryURL.path(percentEncoded: false)

@@ -1508,7 +1508,7 @@ private struct SourceRow: View {
 /// while a `-NookPerfScript` run is in progress; otherwise the probe is inert.
 @MainActor
 enum PerfListScrollTarget {
-    static let isEnabled = ProcessInfo.processInfo.arguments.contains("-NookPerfScript")
+    static let isEnabled = PerfLaunch.value(for: "-NookPerfScript") != nil
     fileprivate static weak var probe: PerfDisplayLinkProbe.ProbeView?
     private static var frameWaiters: [CheckedContinuation<Void, Never>] = []
     private static var frameGeneration = 0

@@ -34,11 +34,36 @@ final class PerfDriver {
     /// Direct child launches may begin without a foreground activation event.
     /// This acts on this process only, even if the installed app shares its id.
     static func prepareLaunchIfRequested() {
-        guard ProcessInfo.processInfo.arguments.contains("-NookPerfScript") else { return }
+        guard PerfLaunch.isActive else { return }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         MainThreadLog.note("perf.activation", extra: "pid=\(ProcessInfo.processInfo.processIdentifier) windows=\(NSApp.windows.count) policy=\(NSApp.activationPolicy().rawValue)")
         MainThreadLog.flush()
+        requestInitialWindow(after: 1, retry: true)
+    }
+
+    /// With no saved application state, a directly launched child never gets
+    /// its initial `Window("main")`. Ask for it the way a Dock click does. The
+    /// window comes from SwiftUI's default reopen handling, not app code:
+    /// `applicationShouldHandleReopen` returns true, but `WindowReopener` is
+    /// still nil because no window has appeared yet. `Window` is single-instance,
+    /// so a reopen while the window is still being built (a heavy library's
+    /// init) only re-fronts it. Retries once for a slow launch.
+    private static func requestInitialWindow(after delay: TimeInterval, retry: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard !NSApp.windows.contains(where: \.isVisible) else { return }
+            let windowsBefore = NSApp.windows.count
+            let event = NSAppleEventDescriptor(
+                eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEReopenApplication),
+                targetDescriptor: .currentProcess(), returnID: AEReturnID(kAutoGenerateReturnID),
+                transactionID: AETransactionID(kAnyTransactionID))
+            _ = try? event.sendEvent(options: .noReply, timeout: 1)
+            // The event is handled on a later runloop turn.
+            DispatchQueue.main.async {
+                MainThreadLog.note("perf.activation", extra: "reopenApplication windowsBefore=\(windowsBefore) windows=\(NSApp.windows.count)")
+            }
+            if retry { requestInitialWindow(after: 2, retry: false) }
+        }
     }
 
     private struct Script: Decodable {
@@ -359,11 +384,7 @@ final class PerfDriver {
         return nil
     }
 
-    private func launchValue(_ key: String) -> String? {
-        let arguments = ProcessInfo.processInfo.arguments
-        guard let index = arguments.firstIndex(of: key), arguments.indices.contains(index + 1) else { return nil }
-        return arguments[index + 1]
-    }
+    private func launchValue(_ key: String) -> String? { PerfLaunch.value(for: key) }
 }
 
 /// Posts key events from a wall-clock dispatch timer. Keeping this outside the

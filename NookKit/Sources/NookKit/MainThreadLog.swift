@@ -381,8 +381,7 @@ public enum MainThreadLog {
     }
 
     private static func launchValue(_ key: String, in arguments: [String]) -> String? {
-        guard let index = arguments.firstIndex(of: key), arguments.indices.contains(index + 1) else { return nil }
-        return arguments[index + 1]
+        PerfLaunch.value(for: key, in: arguments)
     }
 
     private static func token(_ value: String) -> String { value.replacingOccurrences(of: " ", with: "_") }

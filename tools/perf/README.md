@@ -66,33 +66,55 @@ older than HEAD. Each child receives an explicit `-NookPerfLog` path beneath
 `perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`. The runner never reads or
 moves the real Nook container log or changes the installed app's defaults.
 
-The runner executes `Nook.app/Contents/MacOS/Nook` directly as its child and
-waits for that PID. Round 3 observed `open -n -W` hang 3/3 times after
-`run.begin`, with zero windows and no `perf.library`, while the same binary
-and arguments worked directly. The installed app and its live widget share
-`com.tim.nook` with this build: Launch Services bundle resolution and restored
-window state are suspected, but the precise macOS cause is unconfirmed.
-The worker also reproduced a zero-window launch with direct execution; a
-noninteractive launching process without the normal WindowServer/GUI context
-is another possible cause. Invoke the runner from a normal logged-in user shell
-when that occurs. Direct execution bypasses Launch Services and the runner disables saved-window
-restoration for this launch via argument-domain defaults; the DEBUG launch hook
-sets the current process activation policy to regular and activates it when
-`-NookPerfScript` is present. The driver orders its own
-window front and calls `NSApp.activate(ignoringOtherApps: true)` without any
-bundle-id lookup. The DEBUG logger also accepts `NOOK_PERF_LOG_PATH`, with
-`-NookPerfLog` taking precedence; absent either override, its usual path is
-unchanged. Release behavior is unchanged.
+The runner executes `Nook.app/Contents/MacOS/Nook` directly as its child
+(never `open`) and waits for that PID; only that PID is ever signalled. It
+refuses `/Applications/Nook.app`, an app outside the repository unless
+`NOOK_PERF_APP` is paired with `NOOK_PERF_ALLOW_EXTERNAL_APP=1`, a
+team-signed app (perf builds are unsigned), and any build without the DEBUG
+perf hooks. Saved-window restoration is disabled for the launch via
+argument-domain defaults, which are never persisted. So are
+`nookPlusSessionConfigured` and `geminiKeyConfigured` (both `NO`), so the UI
+and Plus code never believe a session or key exists.
+
+Two causes of a launch that logs `run.begin` but never reaches
+`perf.library` were verified with `sample`; both fixes are DEBUG-only and
+leave release behavior unchanged:
+
+- **Keychain prompt in an unsigned build.** `ContentView.init` builds a
+  `PlusStore`, whose `PlusCredential.current` read (`SecItemCopyMatching`)
+  blocks the main thread on a Keychain access prompt nobody answers. Under
+  `-NookPerfLibrary` (`PerfLaunch.isActive`), `PlusCredential.current` and
+  `GeminiCredential.apiKey` return nil without touching the Keychain. Because
+  every Plus call then fails as `.sessionInvalid` and signs out, the writes are
+  guarded too: `PlusCredential.store`/`signOut`, `GeminiCredential.setAPIKey`,
+  `PlusOwnFeed.remember`, and the local app reset are no-ops (or throw) in a
+  perf run, so it can never delete the real Keychain items or rewrite their
+  defaults flags.
+- **No initial window.** A directly executed child without saved application
+  state never gets its `Window("main")`. When no window is visible one second
+  after launch, the DEBUG launch hook sends this process a
+  `kAEReopenApplication` event (what a Dock click sends) and retries once at
+  three seconds. The window comes from SwiftUI's default reopen handling.
+  `Window` is single-instance, so the reopen cannot add a second window. The
+  hook also sets the activation policy to regular and activates the process;
+  it logs `perf.activation` lines (`windowsBefore=`/`windows=` for a reopen).
+
+Each child gets its own `perf-runs/.work/<label>/launch.XXXXXX/` holding
+`stdout.log`, `stderr.log`, and the `-NookPerfLog` file. That path takes
+precedence over `NOOK_PERF_LOG_PATH`; without either the logger's usual path is
+unchanged. Failure messages cite that launch's `stderr.log`.
 
 A watchdog requires `perf.library` within 60 seconds and caps the whole child
 at 600 seconds (switch/scroll/toggle/misc) or 300 seconds (`refresh*.json`).
 `NOOK_PERF_LIBRARY_TIMEOUT_SECONDS` and `NOOK_PERF_RUN_TIMEOUT_SECONDS` override
 those positive-integer limits for testing. On timeout it terminates only its
-child PID, escalates to SIGKILL after one second, appends
+child PID, escalates to SIGKILL after one second if it is still alive, appends
 `perf.driver.error reason=launch-timeout` to the archived log (even if no app
 log exists), and exits 124. Other child/driver failures also exit nonzero.
 `--xctrace` attaches to the same child PID and stops the recording when the
-child exits, so it omits the very earliest launch activity.
+child exits, so it omits the very earliest launch activity. The runner stops
+xctrace with SIGINT and waits for the `.trace` to be written, escalating to
+SIGTERM after 60 seconds and SIGKILL after 10 more.
 
 ```sh
 tools/perf/run.sh before-$(git rev-parse --short HEAD) lib-10k tools/perf/scripts/switch.json none
@@ -130,7 +152,8 @@ tools/perf/run-all.sh before-$(git rev-parse --short HEAD)
 `run-all.sh` refuses a label whose `perf-runs/<label>` directory is non-empty,
 so a retry cannot silently mix more than five repetitions into a median. Use a
 new label after an interrupted matrix. A failed launch skips the remaining
-launches in that group; other groups continue. The final `groups.txt` summary
+launches in that group; other groups continue. Ctrl-C (or a run.sh exit of
+130/143) aborts the whole matrix instead of moving on to the next group. The final `groups.txt` summary
 records every group outcome, and any failure makes run-all exit 1. B3 and E3 wait for ambient refresh to
 finish; with 300 feeds, two fetches at a time, and the deterministic 50–800 ms
 latency they normally take about 65 seconds each. An interactive six-at-a-time

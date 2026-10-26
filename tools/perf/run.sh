@@ -28,11 +28,6 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # NOOK_PERF_ALLOW_ONONE=1 to pass the check after the run.
 app="${NOOK_PERF_APP:-$repo_root/DerivedData-perf/Build/Products/Debug/Nook.app}"
 executable="$app/Contents/MacOS/Nook"
-# Never let an override launch the user's installed app.
-if [[ "$app" -ef /Applications/Nook.app ]]; then
-  echo "refusing to launch the installed /Applications/Nook.app" >&2
-  exit 2
-fi
 port=8765
 library_timeout="${NOOK_PERF_LIBRARY_TIMEOUT_SECONDS:-60}"
 case "$(basename "$script_arg")" in refresh*) default_cap=300 ;; *) default_cap=600 ;; esac
@@ -53,6 +48,28 @@ fi
 [[ -d "$golden" ]] || { echo "golden library not found: $golden" >&2; exit 1; }
 [[ -f "$script_arg" ]] || { echo "scenario script not found: $script_arg" >&2; exit 1; }
 [[ -x "$executable" ]] || { echo "perf app not found: $app (run make perf-build first)" >&2; exit 1; }
+# Never let an override launch the user's installed app, or any build without
+# the DEBUG perf hooks that keep a run off the real Keychain and defaults.
+if [[ "$app" -ef /Applications/Nook.app ]]; then
+  echo "refusing to launch the installed /Applications/Nook.app" >&2
+  exit 2
+fi
+app_real="$(cd "$app" && pwd -P)"
+if [[ "$app_real" != "$repo_root"/* && "${NOOK_PERF_ALLOW_EXTERNAL_APP:-0}" != "1" ]]; then
+  echo "refusing to launch an app outside $repo_root: $app_real (set NOOK_PERF_ALLOW_EXTERNAL_APP=1 to allow)" >&2
+  exit 2
+fi
+# Perf builds are unsigned; a team signature means a distributed build.
+team="$(codesign -dv "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p' || true)"
+if [[ -n "$team" && "$team" != "not set" ]]; then
+  echo "refusing to launch an app signed by team $team: $app (perf builds are unsigned)" >&2
+  exit 2
+fi
+# A `make build` app keeps its code in Nook.debug.dylib beside the executable.
+if ! LC_ALL=C grep -aqr -- '-NookPerfLibrary' "$app/Contents/MacOS"; then
+  echo "refusing to launch a build without DEBUG perf hooks: $app" >&2
+  exit 2
+fi
 
 lib_name="$(basename "$golden")"
 script_name="$(basename "$script_arg")"
@@ -91,10 +108,31 @@ stop_child() {
   kill "$child_pid" 2>/dev/null || true
   # A stuck app may ignore SIGTERM. Target only the child we launched.
   sleep 1
-  kill -KILL "$child_pid" 2>/dev/null || true
+  if kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" 2>/dev/null || true; fi
+}
+# Waits up to $2 seconds for PID $1 to exit.
+wait_exit() {
+  local _
+  for _ in $(seq "$(($2 * 10))"); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  ! kill -0 "$1" 2>/dev/null
+}
+# Lets xctrace finish writing the .trace. A background job may inherit SIGINT
+# as ignored, so escalate to TERM, then KILL, instead of waiting out
+# --time-limit. Returns xctrace's status.
+stop_trace() {
+  [[ -n "$trace_pid" ]] || return 0
+  kill -INT "$trace_pid" 2>/dev/null || true
+  wait_exit "$trace_pid" 60 || { kill -TERM "$trace_pid" 2>/dev/null || true; wait_exit "$trace_pid" 10; } || kill -KILL "$trace_pid" 2>/dev/null || true
+  local trace_status=0
+  wait "$trace_pid" 2>/dev/null || trace_status=$?
+  trace_pid=""
+  return "$trace_status"
 }
 cleanup() {
-  [[ -z "$trace_pid" ]] || kill -INT "$trace_pid" 2>/dev/null || true
+  stop_trace || true
   [[ -z "$watchdog_pid" ]] || kill "$watchdog_pid" 2>/dev/null || true
   if [[ -n "$child_pid" ]]; then
     stop_child
@@ -143,6 +181,9 @@ launch_args=(
   -NookFaviconFetch NO
   -NookAICategorize NO
   -NookFreezeRelativeTime
+  # Argument domain only, never persisted: no Plus session or Gemini key.
+  -nookPlusSessionConfigured NO
+  -geminiKeyConfigured NO
 )
 [[ -z "$only" ]] || launch_args+=(-NookPerfOnly "$only")
 
@@ -193,22 +234,22 @@ fi
 watchdog_pid=""
 child_pid=""
 if [[ -n "$trace_pid" ]]; then
-  kill -INT "$trace_pid" 2>/dev/null || true
   trace_status=0
-  wait "$trace_pid" || trace_status=$?
-  trace_pid=""
+  stop_trace || trace_status=$?
   if [[ "$status" -eq 0 && "$trace_status" -ne 0 ]]; then status=$trace_status; fi
 fi
 
 if [[ -f "$source_log" ]]; then mv "$source_log" "$destination"; else touch "$destination"; fi
 if [[ -f "$timeout_marker" ]]; then
   echo "perf.driver.error reason=launch-timeout phase=$(cat "$timeout_marker") libraryLimit=$library_timeout totalLimit=$run_timeout" >>"$destination"
-  echo "launch timed out; see $destination" >&2
+  echo "launch timed out; see $destination and $launch_tmp/stderr.log" >&2
   status=124
 elif [[ "$status" -ne 0 ]]; then
   echo "perf.driver.error reason=child-exit status=$status" >>"$destination"
+  echo "child exited with status $status; see $launch_tmp/stderr.log" >&2
 elif ! grep -q 'perf\.library' "$destination"; then
   echo "perf.driver.error reason=missing-library" >>"$destination"
+  echo "no perf.library in the log; see $launch_tmp/stderr.log" >&2
   status=1
 fi
 echo "$destination"
