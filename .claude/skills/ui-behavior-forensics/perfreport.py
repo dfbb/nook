@@ -9,7 +9,9 @@ import math
 import pathlib
 import re
 import statistics
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -77,6 +79,12 @@ VARIANTS = ("none", "trickle", "burst", "big1")
 LOG_NAME = re.compile(r"-(?P<variant>none|trickle|burst|big1)-\d+\.log$")
 SCENARIO_BEGIN = re.compile(r"\bscenario\.begin\s+(?P<fields>.*)$")
 NON_METRICS = {"frames", "rep", "cold", "toggles", "dur", "activeDur"}
+# measurement.md §4: a run (driver.error) or rep (timeouts) that logged one of
+# these is invalid. PerfDriver logs settle.timeout before the rep's
+# scenario.begin and quiesce.timeout before its stats, both with id=; the
+# list's perf.frame.timeout carries no id and taints the next stats record.
+INVALID_FILE = re.compile(r"\bperf\.driver\.error\b")
+INVALID_REP = re.compile(r"\bperf\.(?P<kind>quiesce|settle|frame)\.timeout\b(?P<fields>.*)$")
 
 SELF_BEFORE = """\
 0 run.begin label=before sha=1111111 lib=lib-10k hz=60 log=/tmp/a.log
@@ -133,6 +141,59 @@ SELF_REFRESH_TRICKLE = """\
 3 scenario.begin         id=B2 rep=1 cold=0
 4 scenario.stats id=B2 rep=1 dur=3000 publish=3 mergeMs=3 mergeFlush=10 mergeFallback=1
 """
+# measurement.md §4 invalid markers: quiesce (inside the window) and settle
+# (before the next rep's scenario.begin) carry id=; frame.timeout does not.
+SELF_INVALID = """\
+0 run.begin label=after sha=2222222 lib=lib-10k hz=60 log=/tmp/b.log
+1 scenario.begin         id=A1 rep=1 cold=0
+2 scenario.stats id=A1 rep=1 cold=0 worstStall=50 ttfr=100
+3 scenario.begin         id=A1 rep=2 cold=0
+3.5 perf.quiesce.timeout   id=A1
+4 scenario.stats id=A1 rep=2 cold=0 worstStall=900 ttfr=900
+4.5 perf.settle.timeout    id=A1
+5 scenario.begin         id=A1 rep=3 cold=0
+6 scenario.stats id=A1 rep=3 cold=0 worstStall=800 ttfr=800
+7 scenario.begin         id=A1 rep=4 cold=0
+8 scenario.stats id=A1 rep=4 cold=0 worstStall=60 ttfr=120
+9 scenario.begin         id=C1 rep=1 cold=0
+9.5 perf.frame.timeout
+10 scenario.stats id=C1 rep=1 cold=0 worstFrame=700
+11 scenario.begin         id=C1 rep=2 cold=0
+12 scenario.stats id=C1 rep=2 cold=0 worstFrame=40
+"""
+SELF_DRIVER_ERROR = """\
+0 run.begin label=after sha=2222222 lib=lib-10k hz=60 log=/tmp/b.log
+1 scenario.stats id=A2 rep=1 cold=0 worstStall=10
+2 perf.driver.error      feed=nope reason=not_found
+3 scenario.stats id=A2 rep=2 cold=0 worstStall=20
+"""
+# One FAIL per §5 gate the comparison table does not show, plus passing
+# neighbours that must stay out of the gate-failure list.
+SELF_GATES = {
+    "perf-runs/g/lib-10k-switch-none-1.log": """\
+0 run.begin lib=lib-10k
+1 scenario.stats id=A10 rep=1 cold=0 worstStall=400 stalls250=1 ttfr=300 publish=3 applyMs=5
+2 scenario.stats id=A2 rep=1 cold=0 worstStall=40 stalls250=0 ttfr=90 publish=1 applyMs=1
+""",
+    "perf-runs/g/lib-10k-refresh-B2-trickle-1.log": """\
+0 run.begin lib=lib-10k
+1 scenario.stats id=B2 rep=1 cold=0 dur=3000 stalls250=1 stalls100=2 mergeFlush=10 mergeFallback=3 hitchRatio=7 mergeChangedNoNew=4 publish=2
+""",
+    "perf-runs/g/lib-10k-scroll-none-1.log": """\
+0 run.begin lib=lib-10k
+1 scenario.stats id=C2 rep=1 cold=0 stalls100=1 hitchRatio=3
+""",
+    "perf-runs/g/lib-10k-toggle-none-1.log": """\
+0 run.begin lib=lib-10k
+1 scenario.stats id=D1 rep=1 cold=0 stalls100=1 readerTTFR=80
+2 scenario.stats id=D2 rep=1 cold=0 toggles=20 body=40 rowcontent=60
+3 scenario.stats id=D5 rep=1 cold=0 toggles=20 hlcTick=40
+""",
+    "perf-runs/g/lib-20k-refresh-B1-none-1.log": """\
+0 run.begin lib=lib-20k
+1 scenario.stats id=B1 rep=1 cold=0 stalls250=1 stalls100=3 mergeChangedNoNew=9 publish=4
+""",
+}
 
 
 @dataclass
@@ -145,6 +206,7 @@ class Record:
     raw: str
     path: str
     window: list[str]
+    invalid: str = ""
 
 
 def fields(text: str) -> dict[str, str]:
@@ -195,6 +257,8 @@ def derived(scenario: str, values: dict[str, float]) -> None:
     if toggles:
         values["rowcontentPerToggle"] = values.get("rowcontent", 0) / toggles
         values["listBodyPerToggle"] = values.get("body", 0) / toggles
+        if "hlcTick" in values:
+            values["hlcTickPerToggle"] = values["hlcTick"] / toggles
         if "updateInPlaceMs" in values:
             values["updateInPlaceTotalMs"] = values["updateInPlaceMs"]
             values["updateInPlaceMeanMs"] = values["updateInPlaceMs"] / toggles
@@ -219,7 +283,17 @@ def parse_text(text: str, path: str = "<sample>") -> tuple[list[Record], list[st
     variant = variant_for(path, {})
     begun: dict[str, dict[str, str]] = {}
     window: list[str] = []
+    file_error = next((raw.strip() for raw in text.splitlines() if INVALID_FILE.search(raw)), "")
+    tainted_ids: dict[str, str] = {}
+    tainted_next = ""
     for raw in text.splitlines():
+        timeout = INVALID_REP.search(raw)
+        if timeout:
+            timeout_id = fields(timeout["fields"]).get("id")
+            if timeout_id:
+                tainted_ids.setdefault(timeout_id, f"perf.{timeout['kind']}.timeout")
+            else:
+                tainted_next = tainted_next or f"perf.{timeout['kind']}.timeout"
         begin = BEGIN.search(raw)
         if begin:
             beginnings.append(raw)
@@ -255,7 +329,9 @@ def parse_text(text: str, path: str = "<sample>") -> tuple[list[Record], list[st
         cold = scenario == "A1" and marked_cold
         values = {key: parsed_value for key, value in parsed.items() if (parsed_value := number(value)) is not None}
         derived(scenario, values)
-        records.append(Record(scenario, library, variant, cold, values, raw, path, window))
+        invalid = ("perf.driver.error" if file_error else "") or tainted_ids.pop(scenario, "") or tainted_next
+        tainted_next = ""
+        records.append(Record(scenario, library, variant, cold, values, raw, path, window, invalid))
         window = []
     return records, beginnings
 
@@ -277,6 +353,8 @@ def summarize(records: list[Record]) -> dict:
     """summary[scenario][lib][variant]["warm"|"cold"][metric] = {median, worst, n}."""
     grouped: dict[tuple[str, str, str, bool], list[Record]] = defaultdict(list)
     for record in records:
+        if record.invalid:
+            continue
         grouped[(record.scenario, record.library, record.variant, record.cold)].append(record)
     result: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     for (scenario, library, variant, cold), rows in sorted(grouped.items()):
@@ -287,6 +365,22 @@ def summarize(records: list[Record]) -> dict:
             metrics[metric] = {"median": statistics.median(samples), "worst": max(samples), "n": len(samples)}
         result[scenario][library][variant]["cold" if cold else "warm"] = metrics
     return result
+
+
+def dropped(records: list[Record]) -> dict:
+    """Invalid reps left out of summarize: counts per reason and per file."""
+    reasons: dict[str, int] = defaultdict(int)
+    files: set[str] = set()
+    for record in records:
+        if record.invalid:
+            reasons[record.invalid] += 1
+            files.add(record.path)
+    return {"reps": sum(reasons.values()), "files": len(files), "reasons": dict(sorted(reasons.items()))}
+
+
+def dropped_text(name: str, counts: dict) -> str:
+    detail = ", ".join(f"{reason}×{count}" for reason, count in counts["reasons"].items())
+    return f"{name}: dropped {counts['reps']} invalid reps in {counts['files']} files" + (f" ({detail})" if detail else "")
 
 
 def fmt(value: float | None) -> str:
@@ -302,20 +396,28 @@ def metric(summary: dict, scenario: str, library: str, variant: str, name: str) 
     return chosen.get("warm", {}).get(name)
 
 
-def threshold_for(scenario: str, library: str, name: str) -> tuple[float | None, float | None, str] | None:
+def threshold_for(scenario: str, library: str, name: str, variant: str = "none") -> tuple[float | None, float | None, str] | None:
     # 20k enforces only stalls≥250 = 0 (and A worstStall <250), except the C
     # group, which measurement.md §5/§7 judge on 20k as well (C5).
     if library == "20k" and scenario[0] != "C":
         if name == "stalls250":
             return (0, 0, "stalls≥250 = 0")
         return (None, 250.0, "<250") if (scenario[0], name) == ("A", "worstStall") else None
-    if scenario == "B1" and name == "publish":
-        return (0, 0, "0")
+    # B1's zero-publish/zero-changed gates assume no new items, i.e. `none`.
+    if name in ("publish", "mergeChangedNoNew") and scenario == "B1":
+        return ((0, 0, "0") if name == "publish" else THRESHOLDS["B.mergeChangedNoNew"]) if variant in ("none", "-") else None
+    if name == "mergeChangedNoNew":
+        return None
+    if (scenario, name) == ("D1", "stalls100"):
+        return (0, 0, "0 (D1)")
+    if (scenario, name) == ("D5", "hlcTickPerToggle"):
+        return (1, 1, "1 per open (D5)")
     return THRESHOLDS.get(f"{scenario[0]}.{name}")
 
 
-def verdict(scenario: str, library: str, name: str, stats: dict[str, float] | None) -> tuple[str, str]:
-    threshold = threshold_for(scenario, library, name)
+def verdict(scenario: str, library: str, name: str, stats: dict[str, float] | None,
+            variant: str = "none") -> tuple[str, str]:
+    threshold = threshold_for(scenario, library, name, variant)
     if not threshold:
         return ("–", "–")
     median_limit, worst_limit, label = threshold
@@ -328,12 +430,42 @@ def verdict(scenario: str, library: str, name: str, stats: dict[str, float] | No
     return (label, "PASS" if passed else "FAIL")
 
 
+def gate_failures(summary: dict) -> list[str]:
+    """Every summarized (scenario, lib, variant, metric) a §5 gate covers that FAILs.
+
+    The table above shows a curated subset; this judges all of them, so an A10
+    stall or a B2 fallback ratio cannot pass silently. Cold A1 ttfr is ≤400.
+    """
+    failures = []
+    for scenario in sorted(summary):
+        for library in sorted(summary[scenario]):
+            for variant in sorted(summary[scenario][library]):
+                kinds = summary[scenario][library][variant]
+                for name, stats in sorted(kinds.get("warm", {}).items()):
+                    threshold, status = verdict(scenario, library, name, stats, variant)
+                    if status == "FAIL":
+                        failures.append(f"{scenario}/{library}/{variant} {name}: "
+                                        f"{fmt(stats['median'])} / {fmt(stats['worst'])} (기준 {threshold})")
+                cold = kinds.get("cold", {}).get("ttfr")
+                if cold and cold["worst"] > 400:
+                    failures.append(f"{scenario}/{library}/{variant} cold ttfr: "
+                                    f"{fmt(cold['median'])} / {fmt(cold['worst'])} (기준 ≤400)")
+    return failures
+
+
+def gate_section(failures: list[str]) -> list[str]:
+    if not failures:
+        return ["", "Gate failures: none"]
+    return ["", f"Gate failures ({len(failures)}):"] + [f"- {failure}" for failure in failures]
+
+
 def worsened(old: float, new: float) -> bool:
     """Lower is better for every metric; a rise from 0 counts as a regression."""
     return new > 0 if old == 0 else new > old * 1.10
 
 
-def compare(before: dict, after: dict, before_runs: list[str], after_runs: list[str]) -> str:
+def compare(before: dict, after: dict, before_runs: list[str], after_runs: list[str],
+            drops: tuple[dict, dict] | None = None) -> str:
     lines = [
         "| ID | lib | variant | 지표 | before (med / worst) | after (med / worst) | Δ med | 기준 | 판정 |",
         "|---|---|---|---|---:|---:|---:|---|---|",
@@ -349,7 +481,7 @@ def compare(before: dict, after: dict, before_runs: list[str], after_runs: list[
                 delta_text = f"{(new['median'] - old['median']) / old['median'] * 100:+.1f}%"
             elif new["median"] != 0:
                 delta_text = "0→" + fmt(new["median"])
-        threshold, status = verdict(scenario, library, name, new)
+        threshold, status = verdict(scenario, library, name, new, variant)
         if regression:
             status = (status + "; REGRESSION >10%").strip("; ")
         old_text = "–" if not old else f"{fmt(old['median'])} / {fmt(old['worst'])}"
@@ -390,7 +522,10 @@ def compare(before: dict, after: dict, before_runs: list[str], after_runs: list[
         lines.extend(["", "10% 초과 악화: " + "; ".join(regressions)])
     if cold_rows:
         lines.extend(["", "Cold reps: " + "; ".join(cold_rows)])
+    lines.extend(gate_section(gate_failures(after)))
     lines.extend(["", f"Runs: before={len(before_runs)}, after={len(after_runs)}"])
+    if drops:
+        lines.extend([dropped_text("before", drops[0]), dropped_text("after", drops[1])])
     if before_runs: lines.append("before: `" + before_runs[-1] + "`")
     if after_runs: lines.append("after: `" + after_runs[-1] + "`")
     return "\n".join(lines)
@@ -411,7 +546,8 @@ def print_summary(summary: dict) -> None:
 
 def trail(records: list[Record], scenario: str) -> str:
     """Raw log window of each rep: scenario.begin through scenario.stats, verbatim."""
-    blocks = [f"--- {record.path}\n" + "\n".join(record.window) for record in records if record.scenario == scenario]
+    blocks = [f"--- {record.path}" + (f" (dropped: {record.invalid})" if record.invalid else "") + "\n" + "\n".join(record.window)
+              for record in records if record.scenario == scenario]
     return "\n".join(blocks)
 
 
@@ -490,6 +626,56 @@ def selftest() -> None:
     assert all(r.variant == "trickle" for r in next_records)
     false_cold, _ = parse_text("1 scenario.stats id=A2 rep=0 cold=1 ttfr=50")
     assert len(false_cold) == 1 and not false_cold[0].cold
+
+    # Invalid reps: timeouts drop their rep, driver.error drops the file.
+    invalid_records, _ = parse_text(SELF_INVALID, "perf-runs/after/lib-10k-switch-none-2.log")
+    error_records, _ = parse_text(SELF_DRIVER_ERROR, "perf-runs/after/lib-10k-switch-none-3.log")
+    assert [r.invalid for r in invalid_records] == [
+        "", "perf.quiesce.timeout", "perf.settle.timeout", "", "perf.frame.timeout", ""], invalid_records
+    assert all(r.invalid == "perf.driver.error" for r in error_records) and len(error_records) == 2
+    invalid_summary = summarize(invalid_records + error_records)
+    assert metric(invalid_summary, "A1", "10k", "none", "worstStall") == {"median": 55, "worst": 60, "n": 2}
+    assert metric(invalid_summary, "C1", "10k", "none", "worstFrame") == {"median": 40, "worst": 40, "n": 1}
+    assert "A2" not in invalid_summary
+    counts = dropped(invalid_records + error_records)
+    assert counts == {"reps": 5, "files": 2, "reasons": {
+        "perf.driver.error": 2, "perf.frame.timeout": 1, "perf.quiesce.timeout": 1, "perf.settle.timeout": 1}}, counts
+    assert dropped_text("after", counts).startswith("after: dropped 5 invalid reps in 2 files (")
+    assert "(dropped: perf.quiesce.timeout)" in trail(invalid_records, "A1")
+    dropped_report = compare(before, after, before_runs, after_runs, (dropped(before_records), counts))
+    assert "after: dropped 5 invalid reps in 2 files" in dropped_report, dropped_report
+
+    # Every gate: each summarized metric a §5 threshold covers is judged.
+    gate_records = [record for path, text in SELF_GATES.items() for record in parse_text(text, path)[0]]
+    failures = gate_failures(summarize(gate_records))
+    expected = {
+        "A10/10k/none worstStall", "A10/10k/none stalls250", "A10/10k/none ttfr",
+        "A10/10k/none publish", "A10/10k/none applyMs",
+        "B2/10k/trickle stalls250", "B2/10k/trickle stalls100", "B2/10k/trickle mergeFallbackRatio",
+        "B2/10k/trickle hitchRatio", "C2/10k/none stalls100", "D1/10k/none stalls100",
+        "D2/10k/none listBodyPerToggle", "D5/10k/none hlcTickPerToggle", "B1/20k/none stalls250",
+    }
+    assert {failure.split(":")[0] for failure in failures} == expected, failures
+    # B1's zero-changed gate is a `none` gate only; 20k judges only stalls≥250.
+    assert threshold_for("B2", "10k", "mergeChangedNoNew", "trickle") is None
+    assert threshold_for("B1", "10k", "mergeChangedNoNew", "trickle") is None
+    assert threshold_for("B1", "10k", "publish", "none") == (0, 0, "0")
+    gated = compare(summarize([]), summarize(gate_records), [], [])
+    assert f"Gate failures ({len(expected)}):" in gated and "- D5/10k/none hlcTickPerToggle: 2 / 2" in gated, gated
+
+    # --strict: exit 1 on any gate failure, 0 without the flag or when all pass.
+    with tempfile.TemporaryDirectory() as directory:
+        failing = pathlib.Path(directory, "lib-10k-switch-none-1.log")
+        failing.write_text(SELF_GATES["perf-runs/g/lib-10k-switch-none-1.log"])
+        passing = pathlib.Path(directory, "pass", "lib-10k-switch-none-1.log")
+        passing.parent.mkdir()
+        passing.write_text("0 run.begin lib=lib-10k\n1 scenario.stats id=A2 rep=1 worstStall=40 ttfr=90\n")
+        def exit_code(*argv: str) -> int:
+            return subprocess.run([sys.executable, __file__, *argv], capture_output=True).returncode
+        assert exit_code(str(failing), "--strict") == 1
+        assert exit_code(str(failing)) == 0
+        assert exit_code(str(passing), "--strict") == 0
+        assert exit_code("--compare", str(passing), str(failing), "--strict") == 1
     print("perfreport selftest: PASS")
     print(report)
 
@@ -505,6 +691,8 @@ def main() -> None:
     parser.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
     parser.add_argument("--trail", metavar="ID")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 1 when any §5 gate fails (the after run with --compare)")
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
     if args.selftest:
@@ -514,11 +702,14 @@ def main() -> None:
         before_records, before_runs = load(resolve(args.compare[0]))
         after_records, after_runs = load(resolve(args.compare[1]))
         before, after = summarize(before_records), summarize(after_records)
+        drops = (dropped(before_records), dropped(after_records))
+        failures = gate_failures(after)
         if args.json:
-            print(json.dumps({"before": before, "after": after}, indent=2, sort_keys=True))
+            print(json.dumps({"before": before, "after": after, "dropped": {"before": drops[0], "after": drops[1]},
+                              "gateFailures": failures}, indent=2, sort_keys=True))
         else:
-            print(compare(before, after, before_runs, after_runs))
-        return
+            print(compare(before, after, before_runs, after_runs, drops))
+        sys.exit(1 if args.strict and failures else 0)
     if not args.path:
         parser.error("path is required unless --compare or --selftest is used")
     records, runs = load(resolve(args.path))
@@ -529,10 +720,15 @@ def main() -> None:
         print(text)
         return
     summary = summarize(records)
+    failures = gate_failures(summary)
     if args.json:
-        print(json.dumps({"runs": runs, "scenarios": summary}, indent=2, sort_keys=True))
+        print(json.dumps({"runs": runs, "scenarios": summary, "dropped": dropped(records),
+                          "gateFailures": failures}, indent=2, sort_keys=True))
     else:
         print_summary(summary)
+        print(dropped_text("run", dropped(records)))
+        print("\n".join(gate_section(failures)).lstrip("\n"))
+    sys.exit(1 if args.strict and failures else 0)
 
 
 if __name__ == "__main__":

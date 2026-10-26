@@ -23,11 +23,23 @@ Each invocation also rewrites `perf-data/feeds/<lib>/{none,trickle,burst,big1}`,
 so every library has its own feed XML. Each feed serves only its newest 30
 items plus the variant's additions, like a real rolling feed. Article ids are
 `<feedID>#<guid>`, the shape `RSSFeedService`/`ReaderStore` produce on refresh,
-so `none` yields zero new articles; the always-on test
-`none XML merge has zero changed and zero new articles` parses all 300 XML files
-with the real parser, overlays the shard's read/star/category state, and calls
-the store merge hook to prove the article array is not republished. Running the
-same command twice produces byte-identical fixture contents.
+so `none` yields zero new articles. Running the same command twice produces
+byte-identical fixture contents.
+
+The fixture is a library's steady state, not an ideal one: `NookContent.json`
+holds bodies only for the 600 ids `ReaderStore.recentArticleIDs(from:)` keeps
+(newest by `Article.isOrderedBefore`, `bodyRetentionLimit`), as every replica
+save does. Feed-window articles outside that set load without a body, so
+today's full-equality merge counts them as changed on a `none` refresh (B1
+`mergeChangedNoNew` > 0, lib-5k: 3,440 changed articles over 296 feeds). That is
+the spurious-change bug Phase 1's MergeProjection fixes by comparing a body
+only when the stored article has one. The always-on test
+`none XML merge adds zero articles; changed count tracks the body-retention merge bug`
+parses all 300 XML files with the real parser, overlays the shard's
+read/star/category state, calls the store merge hook, and asserts zero new ids
+and that every change is a body-less stored article. It asserts changed > 0
+today; Phase 1 flips `PerfLibraryGenerator.noneRefreshIsChangeFree` to `true`
+so it asserts zero changed articles and no republish.
 
 `Nook/Info.plist` currently has `NSAppTransportSecurity` →
 `NSAllowsArbitraryLoads=true`, so the cleartext `http://127.0.0.1:8765` feed
@@ -111,3 +123,21 @@ the thresholds from `docs/perf/measurement.md` and calls out every common
 lower-is-better metric whose median worsened by more than 10%, including rises
 from 0. `droppedPct`, `missedSelection`, and `readerTTFR` feed the C3/D1 thresholds,
 which show NO DATA for builds that do not log them.
+
+Invalid repetitions are dropped before summarizing, as `measurement.md` §4
+requires: `perf.quiesce.timeout id=…` and `perf.settle.timeout id=…` drop the
+next stats record of that id, `perf.frame.timeout` drops the next stats record,
+and `perf.driver.error` drops every record in that log file. The summary and
+compare output print how many reps and files were dropped and why; `--trail`
+marks a dropped rep.
+
+Besides the table, every summarized scenario, library, variant, and metric that
+a §5 gate covers is judged (A2–A14, B stalls/fallback ratio/hitch ratio, C
+stalls on 10k, D list.body per toggle, D1 stalls≥100, D5 hlcTick per open, the
+20k stalls≥250 gate, cold A1 ttfr ≤400) and listed under "Gate failures".
+`--strict` exits 1 when that list is not empty (for `--compare`, the after
+run), for CI-style use:
+
+```sh
+python3 .claude/skills/ui-behavior-forensics/perfreport.py --compare before-abc1234 after-p2 --strict
+```

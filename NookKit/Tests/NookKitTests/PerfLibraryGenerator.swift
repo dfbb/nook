@@ -7,7 +7,6 @@ struct PerfLibraryGenerator {
     private static let deviceID = "nook-perf-device"
     private static let referenceDate = Date(timeIntervalSince1970: 1_759_276_800) // 2026-10-01T00:00:00Z
     private static let feedCount = 300
-    private static let bodyRetentionLimit = 600
 
     @Test(
         "generate performance library",
@@ -63,20 +62,7 @@ struct PerfLibraryGenerator {
         let shard = Self.makeStateShard(feeds: feeds, folders: folders, articles: articles, categories: categories)
         try storage.saveShard(shard)
 
-        let newest = articles.sorted(by: Article.isOrderedBefore).prefix(Self.bodyRetentionLimit)
-        var bodies = Dictionary(uniqueKeysWithValues: articles.compactMap { article in
-            article.hasBody ? (article.id, article.body) : nil
-        })
-        for article in newest where !article.hasBody {
-            let paragraphs = [
-                "\(article.title) 본문 첫 문단입니다. Performance fixture body paragraph one.",
-                "스크롤과 리더 로딩을 재현하는 결정적 본문입니다. Deterministic body paragraph two.",
-            ]
-            bodies[article.id] = ArticleBody(
-                bodyParagraphs: paragraphs,
-                contentHTML: "<p>\(Self.xmlEscape(paragraphs.joined(separator: "</p><p>")))</p>"
-            )
-        }
+        let bodies = Self.retainedBodies(articles: articles)
         try storage.saveContent(bodies, retain: Set(bodies.keys))
 
         // Every feed shares the localhost host key, matching ReaderStore.faviconKey(for:).
@@ -162,14 +148,48 @@ struct PerfLibraryGenerator {
         return Fixture(feeds: feeds, folders: folders, articles: articles, byFeed: byFeed)
     }
 
+    /// The content sidecar a real library holds in steady state: bodies only
+    /// for the ids `ReaderStore.recentArticleIDs(from:)` keeps (the newest 600
+    /// by `Article.isOrderedBefore`, ReaderStore.bodyRetentionLimit), which is
+    /// what every replica save retains. Feed-window articles outside that set
+    /// load without a body, exactly as after a real relaunch. Retained articles
+    /// that no feed window gave a body get a deterministic two-paragraph one.
+    private static func retainedBodies(articles: [Article]) -> [Article.ID: ArticleBody] {
+        let retained = ReaderStore.recentArticleIDs(from: articles)
+        var bodies: [Article.ID: ArticleBody] = [:]
+        for article in articles where retained.contains(article.id) {
+            if article.hasBody {
+                bodies[article.id] = article.body
+                continue
+            }
+            let paragraphs = [
+                "\(article.title) 본문 첫 문단입니다. Performance fixture body paragraph one.",
+                "스크롤과 리더 로딩을 재현하는 결정적 본문입니다. Deterministic body paragraph two.",
+            ]
+            bodies[article.id] = ArticleBody(
+                bodyParagraphs: paragraphs,
+                contentHTML: "<p>\(xmlEscape(paragraphs.joined(separator: "</p><p>")))</p>"
+            )
+        }
+        return bodies
+    }
+
     private static func articleID(feedID: String, guid: String) -> String {
         "\(feedID)#\(guid)"
     }
 
-    /// Guards the complete B1 contract without writing files: after shard state
-    /// is materialized, a real `none` parse must add zero articles and trigger
-    /// no Article-array assignment in ReaderStore's current full-equality merge.
-    @Test("none XML merge has zero changed and zero new articles")
+    /// Phase 1's MergeProjection compares a body only when the stored article
+    /// has one. Until it lands, a `none` refresh reports every feed-window
+    /// article outside the 600 retained bodies as changed (stored: no body,
+    /// parsed: the description as body). Flip this to `true` with that fix so
+    /// the test below asserts zero changed articles and no republish.
+    private static let noneRefreshIsChangeFree = false
+
+    /// Guards the B1 contract on the library's steady state (bodies capped at
+    /// the app's retention): after shard state is materialized, a real `none`
+    /// parse must add zero articles. Changed articles are counted and checked
+    /// against `noneRefreshIsChangeFree`.
+    @Test("none XML merge adds zero articles; changed count tracks the body-retention merge bug")
     @MainActor
     func noneRefreshMergeIsNoop() throws {
         var rng = SplitMix64(seed: 42)
@@ -193,13 +213,13 @@ struct PerfLibraryGenerator {
         let storage = ReaderStorage(directoryURL: directory)
         try storage.save(base)
         try storage.saveShard(shard)
-        let bodies = Dictionary(uniqueKeysWithValues: fixture.articles.compactMap { article in
-            article.hasBody ? (article.id, article.body) : nil
-        })
+        let bodies = Self.retainedBodies(articles: fixture.articles)
         try storage.saveContent(bodies, retain: Set(bodies.keys))
+        #expect(bodies.count == 600)
 
         var storedBase = try #require(try storage.load())
         let storedBodies = storage.loadContent()
+        #expect(storedBodies.count == 600)
         storedBase.articles = storedBase.articles.map { article in
             guard let body = storedBodies[article.id] else { return article }
             var article = article
@@ -215,6 +235,9 @@ struct PerfLibraryGenerator {
         store.feeds = materialized.feeds
         store.articles = materialized.articles
 
+        var newArticles = 0
+        var changedArticles = 0
+        var republishedFeeds = 0
         for index in fixture.feeds.indices {
             let feed = fixture.feeds[index]
             let parsed = try Self.parsedFeed(
@@ -223,15 +246,32 @@ struct PerfLibraryGenerator {
             let before = store.articles
             let existingByID = Dictionary(uniqueKeysWithValues: before.map { ($0.id, $0) })
             for var article in parsed.articles {
-                let existing = try #require(existingByID[article.id])
+                guard let existing = existingByID[article.id] else {
+                    newArticles += 1
+                    continue
+                }
                 article.isRead = existing.isRead
                 article.isStarred = existing.isStarred
                 article.categories = existing.categories
                 if !article.hasExplicitPublishDate { article.publishedAt = existing.publishedAt }
-                #expect(article == existing, "feed \(feed.id) changed \(article.id)")
+                if article != existing {
+                    // The only expected difference is the body retention cut.
+                    #expect(!existing.hasBody && article.hasBody, "feed \(feed.id) changed \(article.id)")
+                    changedArticles += 1
+                }
             }
             store._mergeForTesting(parsed)
-            #expect(store.articles == before, "feed \(feed.id) published a no-op merge")
+            if store.articles != before { republishedFeeds += 1 }
+        }
+        print("perf.none.merge new=\(newArticles) changed=\(changedArticles) republishedFeeds=\(republishedFeeds)")
+        #expect(newArticles == 0)
+        if Self.noneRefreshIsChangeFree {
+            #expect(changedArticles == 0)
+            #expect(republishedFeeds == 0)
+        } else {
+            // Today's full-equality merge: the spurious changes B1 measures.
+            #expect(changedArticles > 0)
+            #expect(republishedFeeds > 0)
         }
 
         let libraryIDs = Set(materialized.articles.map(\.id))
