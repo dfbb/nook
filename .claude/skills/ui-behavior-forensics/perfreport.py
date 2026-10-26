@@ -472,6 +472,11 @@ def verdict(scenario: str, library: str, name: str, stats: dict[str, float] | No
     return (label, "PASS" if passed else "FAIL")
 
 
+def cold_gated(scenario: str, library: str) -> bool:
+    """The protocol gates cold ttfr (≤400) on A1/10k only."""
+    return (scenario, library) == ("A1", "10k")
+
+
 def gate_failures(summary: dict) -> list[str]:
     """Every summarized (scenario, lib, variant, metric) a §5 gate covers that FAILs.
 
@@ -491,7 +496,7 @@ def gate_failures(summary: dict) -> list[str]:
                         failures.append(f"{scenario}/{library}/{variant} {name}: "
                                         f"{fmt(stats['median'])} / {fmt(stats['worst'])} (기준 {threshold})")
                 cold = kinds.get("cold", {}).get("ttfr")
-                if library == "10k" and scenario == "A1" and cold and cold["worst"] > 400:
+                if cold_gated(scenario, library) and cold and cold["worst"] > 400:
                     failures.append(f"{scenario}/{library}/{variant} cold ttfr: "
                                     f"{fmt(cold['median'])} / {fmt(cold['worst'])} (기준 ≤400)")
     return failures
@@ -555,12 +560,15 @@ def compare(before: dict, after: dict, before_runs: list[str], after_runs: list[
                 old = old_kinds.get("cold", {}).get("ttfr")
                 new = new_kinds.get("cold", {}).get("ttfr")
                 if old or new:
-                    cold_pass = "NO DATA" if not new else ("PASS" if new["worst"] <= 400 else "FAIL")
+                    if not cold_gated(scenario, library):
+                        cold_verdict = "–, –"
+                    else:
+                        cold_verdict = "≤400, " + ("NO DATA" if not new else ("PASS" if new["worst"] <= 400 else "FAIL"))
                     cold_rows.append(
                         f"{scenario}/{library}/{variant} cold ttfr: "
                         f"{fmt(old['median']) if old else '–'} / {fmt(old['worst']) if old else '–'} → "
                         f"{fmt(new['median']) if new else '–'} / {fmt(new['worst']) if new else '–'} "
-                        f"(≤400, {cold_pass})"
+                        f"({cold_verdict})"
                     )
     if regressions:
         lines.extend(["", "10% 초과 악화: " + "; ".join(regressions)])
@@ -756,6 +764,19 @@ def selftest() -> None:
         assert exit_code(str(failing)) == 0
         assert exit_code(str(passing), "--strict") == 0
         assert exit_code("--compare", str(passing), str(failing), "--strict") == 1
+        # Cold ttfr is gated on A1/10k only; other libs show it without a verdict.
+        empty = pathlib.Path(directory, "empty", "lib-10k-switch-none-1.log")
+        empty.parent.mkdir()
+        empty.write_text("0 run.begin lib=lib-10k\n")
+        for library, shown, code in (("20k", "(–, –)", 0), ("10k", "(≤400, FAIL)", 1)):
+            cold_log = pathlib.Path(directory, f"cold-{library}", f"lib-{library}-switch-none-1.log")
+            cold_log.parent.mkdir()
+            cold_log.write_text(f"0 run.begin lib=lib-{library}\n"
+                                "1 scenario.stats id=A1 rep=0 cold=1 ttfr=900\n"
+                                "2 scenario.stats id=A1 rep=1 cold=0 ttfr=100\n")
+            cold_report = compare(summarize([]), summarize(parse_text(cold_log.read_text(), str(cold_log))[0]), [], [])
+            assert f"A1/{library}/none cold ttfr: – / – → 900 / 900 {shown}" in cold_report, cold_report
+            assert exit_code("--compare", str(empty), str(cold_log), "--strict") == code
         for index, text in enumerate(SELF_GATE_SCOPE.values()):
             scoped = pathlib.Path(directory, f"scope-{index}.log")
             scoped.write_text(text)
