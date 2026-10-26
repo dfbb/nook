@@ -1529,12 +1529,20 @@ enum PerfListScrollTarget {
         let generation = frameGeneration
         await withCheckedContinuation { continuation in
             frameWaiters.append(continuation)
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(250))
-                guard frameGeneration == generation else { return }
-                MainThreadLog.note("perf.frame.timeout")
-                resumeFrameWaiters()
+            armFrameFallback(for: generation)
+        }
+    }
+
+    private static func armFrameFallback(for generation: Int) {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard frameGeneration == generation else { return }
+            if let link = probe?.link, !link.isPaused {
+                armFrameFallback(for: generation)
+                return
             }
+            MainThreadLog.note("perf.frame.timeout")
+            resumeFrameWaiters()
         }
     }
 

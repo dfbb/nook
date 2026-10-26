@@ -1,6 +1,7 @@
 #if DEBUG
-import AppKit
+@preconcurrency import AppKit
 import NookKit
+import ObjectiveC
 
 /// JSON schema:
 /// ```json
@@ -57,9 +58,16 @@ final class PerfDriver {
         didRun = true
         do {
             let script = try JSONDecoder().decode(Script.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            let only = launchValue("-NookPerfOnly").map {
+                Set($0.split(separator: ",").map(String.init))
+            }
+            let steps = only.map { ids in script.steps.filter { ids.contains($0.id) } } ?? script.steps
+            if let only, steps.isEmpty {
+                MainThreadLog.note("perf.driver.error", extra: "reason=no_matching_step only=\(only.sorted().joined(separator: ","))")
+            }
             try await fixLayout()
             let adapter = PerfStoreAdapter(store: store)
-            for step in script.steps {
+            for step in steps {
                 let repetitions = max(1, step.repetitions ?? script.repetitions ?? 5)
                 let includesCold = step.coldFirst ?? script.coldFirst ?? false
                 if includesCold {
@@ -235,17 +243,9 @@ final class PerfDriver {
         window.makeFirstResponder(tableView)
         let startIndex = adapter.selectedIndex
         let repeats = max(1, Int(rate * duration))
-        for index in 0..<repeats {
-            for type in [NSEvent.EventType.keyDown, .keyUp] {
-                if let event = NSEvent.keyEvent(
-                    with: type, location: .zero, modifierFlags: command ? [.command] : [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                    context: nil, characters: "\u{F701}", charactersIgnoringModifiers: "\u{F701}",
-                    isARepeat: type == .keyDown && index > 0, keyCode: 125
-                ) { NSApp.postEvent(event, atStart: false) }
-            }
-            try await Task.sleep(for: .seconds(1 / max(1, rate)))
-        }
+        let posting = await PerfKeyPoster.post(
+            count: repeats, rate: rate, command: command, windowNumber: window.windowNumber,
+            sink: PerfKeyEventSink(application: NSApp))
         // Let the queued events drain: the selection must hold still for 1s (up
         // to 15s) before it is read.
         var last = adapter.selectedIndex
@@ -261,7 +261,7 @@ final class PerfDriver {
         MainThreadLog.scenarioValue("missedSelection", repeats - moved)
         MainThreadLog.note(
             "perf.keys",
-            extra: "posted=\(repeats) moved=\(moved) responder=\(window.firstResponder === tableView ? "table" : "other")")
+            extra: "posted=\(posting.count) moved=\(moved) responder=\(window.firstResponder === tableView ? "table" : "other") keysPostedOverMs=\(posting.overMs.rounded()) achievedHz=\(posting.hz.rounded(toPlaces: 2))")
     }
 
     private var displayHz: Double { Double(NSScreen.main?.maximumFramesPerSecond ?? 60) }
@@ -326,6 +326,86 @@ final class PerfDriver {
         let arguments = ProcessInfo.processInfo.arguments
         guard let index = arguments.firstIndex(of: key), arguments.indices.contains(index + 1) else { return nil }
         return arguments[index + 1]
+    }
+}
+
+/// Posts key events from a wall-clock dispatch timer. Keeping this outside the
+/// main actor prevents the workload from slowing itself down when the UI stalls.
+private enum PerfKeyPoster {
+    struct Result: Sendable {
+        let count: Int
+        let overMs: Double
+        let hz: Double
+    }
+
+    private final class State: @unchecked Sendable {
+        var posted = 0
+        var firstPostedAt: Double?
+    }
+
+    nonisolated static func post(
+        count: Int, rate: Double, command: Bool, windowNumber: Int, sink: PerfKeyEventSink
+    ) async -> Result {
+        let safeRate = max(1, rate)
+        let interval = 1 / safeRate
+        return await withCheckedContinuation { continuation in
+            let queue = DispatchQueue(label: "com.tim.nook.perf-key-poster", qos: .userInitiated)
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            let state = State()
+            timer.schedule(
+                deadline: .now() + interval,
+                repeating: interval,
+                leeway: .milliseconds(1))
+            timer.setEventHandler {
+                let now = ProcessInfo.processInfo.systemUptime
+                if state.firstPostedAt == nil { state.firstPostedAt = now - interval }
+                for type in [NSEvent.EventType.keyDown, .keyUp] {
+                    if let event = NSEvent.keyEvent(
+                        with: type, location: .zero,
+                        modifierFlags: command ? [.command] : [], timestamp: now,
+                        windowNumber: windowNumber, context: nil,
+                        characters: "\u{F701}", charactersIgnoringModifiers: "\u{F701}",
+                        isARepeat: type == .keyDown && state.posted > 0, keyCode: 125
+                    ) {
+                        sink.post(event)
+                    }
+                }
+                state.posted += 1
+                guard state.posted == count else { return }
+                let overMs = (now - (state.firstPostedAt ?? now)) * 1000
+                timer.cancel()
+                continuation.resume(returning: Result(
+                    count: state.posted,
+                    overMs: overMs,
+                    hz: overMs > 0 ? Double(state.posted) / (overMs / 1000) : 0))
+            }
+            timer.activate()
+        }
+    }
+}
+
+/// AppKit documents `postEvent` as thread-safe, but its Swift overlay marks all
+/// `NSApplication` methods main-actor isolated. Call the same Objective-C entry
+/// point through its IMP so the wall-clock timer remains genuinely off-main.
+private final class PerfKeyEventSink: @unchecked Sendable {
+    private let application: AnyObject
+
+    init(application: NSApplication) {
+        self.application = application
+    }
+
+    nonisolated func post(_ event: NSEvent) {
+        let selector = NSSelectorFromString("postEvent:atStart:")
+        typealias PostEvent = @convention(c) (AnyObject, Selector, AnyObject, Bool) -> Void
+        let implementation = class_getMethodImplementation(NSApplication.self, selector)
+        unsafeBitCast(implementation, to: PostEvent.self)(application, selector, event, false)
+    }
+}
+
+private extension Double {
+    func rounded(toPlaces places: Int) -> Double {
+        let factor = pow(10, Double(places))
+        return (self * factor).rounded() / factor
     }
 }
 

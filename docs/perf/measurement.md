@@ -91,6 +91,7 @@
 
 - 피드별 글 수는 Zipf 분포입니다(상위 10개 피드가 30%). 작은 피드 `feed-small`은 30개로 고정해 "피드에서 All로" 원래 증상(5초 정지)을 재현합니다.
 - 글 길이는 실제와 비슷하게: 제목 40~90자(한/영 혼합), summary 200자, body는 `NookContent.json`에 최근 일부만 넣습니다.
+- body는 앱의 보존 정책과 같게 `ReaderStore.recentArticleIDs(from:)`가 남기는 최근 600개(`Article.isOrderedBefore` 순, `bodyRetentionLimit`)에만 넣습니다. 그래서 재실행 후의 실제 정상 상태와 같고, 600개 밖의 피드 윈도 글은 body 없이 로드됩니다. 따라서 현재 코드에서 `none` 새로고침은 `mergeChangedNoNew > 0`을 냅니다(lib-5k 기준 3,440개 글, 296개 피드). 이것이 Phase 1의 `MergeProjection`이 고치는 가짜 changed이며, B1 `changedNoNew = 0` 기준은 Phase 1 이후에 통과해야 합니다.
 - `publishedAt`는 고정 기준일 `2026-10-01T00:00Z`부터 거꾸로 분포시킵니다. 실행 시각과 무관하게 같은 값이 나옵니다.
 - 모든 `feedURL`은 `http://127.0.0.1:8765/f/<n>.xml`입니다. 외부 네트워크 호출은 0이어야 합니다.
 - 실행 예:
@@ -120,6 +121,7 @@ NOOK_GEN_PERF_LIB=$PERF/golden/lib-10k NOOK_GEN_N=10000 swift test --package-pat
 ## 3. 자동화: 앱 안에서 도는 스크립트 드라이버
 
 `Nook/PerfDriver.swift`(`#if DEBUG`, `@MainActor`)를 둡니다. `-NookPerfScript <json>`을 받으면 라이브러리 로드가 끝난 뒤 단계를 차례로 실행하고, 끝나면 `MainThreadLog.flush()`를 부르고 `NSApp.terminate`합니다.
+- 한 단계만 별도 실행할 때는 `-NookPerfOnly B3`를 더합니다. 쉼표로 여러 ID를 지정할 수도 있습니다. P0-B의 `run-all.sh`는 각 refresh 단계만 담은 JSON을 파생해 단계·반복마다 별도 실행하므로 이 필터 없이도 B2/B3/B5가 서로 오염되지 않습니다.
 - 드라이버는 공개 API를 **어댑터 한 겹**을 거쳐 호출합니다: `selectSmartSource`, `feedSelection`, 카테고리 선택, `refreshAll()`, `refresh(feedID:)`, `refreshOnActivation(honorThrottle:false)`, `setRead`, `toggleStarred`, `selectedArticleID`. 그래서 Phase 사이에 이름이 바뀌어도 고칠 곳은 어댑터뿐입니다.
 - 모든 단계의 형태는 같습니다: `settle`(2초 동안 stall 0, `isRefreshing == false`) → `scenarioBegin` → 동작 → `quiesce`(1.5초 동안 publish·settle·stall 0 + refresh 끝, 최대 180초) → `scenarioEnd`.
 - 시나리오마다 5회 반복합니다. **cold**(실행 직후 첫 전환)는 A1에만 `coldFirst:true`로 rep 0을 붙여 따로 1회 기록합니다(`cold=1`). 다른 단계의 rep은 모두 warm입니다.
@@ -153,10 +155,10 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 
 **C. 스크롤** (All, `lib-10k`/`lib-20k`)
 
-드라이버가 목록 스크롤 뷰의 clip view를 **display-link 콜백마다 한 번씩** 움직입니다(probe의 콜백이 드라이버의 continuation을 깨웁니다). 타이머 slack과 무관하게 vsync당 이동이 정확히 1회이므로 결정적입니다. 250ms 안에 콜백이 없으면 `perf.frame.timeout`을 남기고 진행합니다.
+드라이버가 목록 스크롤 뷰의 clip view를 **display-link 콜백마다 한 번씩** 움직입니다(probe의 콜백이 드라이버의 continuation을 깨웁니다). 타이머 slack과 무관하게 vsync당 이동이 정확히 1회이므로 결정적입니다. 250ms fallback은 링크가 살아 있고 재생 중이면 다시 무장하며, 링크가 없거나 일시 정지된 경우에만 `perf.frame.timeout`을 남기고 진행합니다. 따라서 측정 대상인 긴 메인 스레드 stall 자체가 실행을 무효화하지 않습니다.
 - C1 fling: 맨 위에서 시작해 초기 속도 6000pt/s, 프레임당 감쇠 0.95로 8회 연속
 - C2 스크롤바 드래그: 1초 동안 30단계로 끝까지, 그다음 `scrollToEndOfDocument` 즉시 점프 1회
-- C3 키 반복: 먼저 목록 `NSTableView`를 first responder로 만듭니다(사이드바가 키를 가져가 피드 선택을 바꾸지 않게). 그다음 `NSApp.postEvent`로 ↓ keyDown/keyUp 쌍을 30Hz로 5초간 보냅니다(List 네이티브 선택 이동, 첫 keyDown만 `isARepeat=false`). ⌘↓(Next Article, 리더를 엶)는 `target:"commandDown"`으로 같은 방식입니다. 앱에 j/k 단축키는 없으므로 ↓와 ⌘↓를 씁니다. 끝나면 선택이 1초간 멈출 때까지 기다린 뒤 선택 index 변화로 이동 수를 세어 `perf.keys posted=N moved=M responder=table`과 stats의 `missedSelection = N − M`을 남깁니다.
+- C3 키 반복: 먼저 목록 `NSTableView`를 first responder로 만듭니다(사이드바가 키를 가져가 피드 선택을 바꾸지 않게). 그다음 메인 액터와 독립된 wall-clock dispatch timer가 `NSApp.postEvent`로 ↓ keyDown/keyUp 쌍을 30Hz로 5초간 보냅니다(`postEvent`는 서브스레드에서 호출할 수 있고, List의 네이티브 선택을 이동시키며 첫 keyDown만 `isARepeat=false`). ⌘↓(Next Article, 리더를 엶)는 `target:"commandDown"`으로 같은 방식입니다. 앱에 j/k 단축키는 없으므로 ↓와 ⌘↓를 씁니다. 끝나면 선택이 1초간 멈출 때까지 기다린 뒤 선택 index 변화로 이동 수를 세어 `perf.keys posted=N moved=M responder=table keysPostedOverMs=… achievedHz=…`와 stats의 `missedSelection = N − M`을 남깁니다.
 - C4 C1 도중에 B2 시작 (새로고침 중 스크롤)
 - C5 윈도 경계: 1500pt/s 등속으로 150행에서 450행까지 내려가며 200/400 경계를 넘깁니다. 이어서 `lib-20k`에서 끝까지 내립니다(스크롤로만 윈도가 커지는 구간).
 
@@ -183,7 +185,7 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 - 같은 머신, 전원 연결, 다른 앱 종료, Low Power 꺼짐
 - 실행 전 `pmset -g therm`이 정상인지 확인
 - 디스플레이 Hz를 `run.begin`에 기록합니다. ProMotion이면 120Hz와 60Hz를 섞어서 비교하지 않습니다.
-- before와 after는 같은 빌드 설정(Debug, 같은 서명 여부)으로 측정합니다.
+- before와 after는 모두 `make perf-build`로 빌드하고 같은 서명 여부로 측정합니다. 이 타깃은 DEBUG 계측을 유지하면서 Swift 앱 코드를 `-O`로 최적화하므로, `-Onone`이 대형 SwiftUI 목록 비용을 과장해 비교 실행을 수십 초씩 늘리는 문제를 피합니다.
 
 ---
 
@@ -237,12 +239,13 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 - 같은 로그에 `perf.driver.error`, `perf.quiesce.timeout`, `perf.settle.timeout`, `perf.frame.timeout`이 있으면 그 실행(또는 해당 rep)은 무효로 봅니다.
 - `--compare before-ebd5ee6 after-p2`는 5절 표를 markdown으로 출력하고, 임계값 PASS/FAIL과 10% 이상 악화된 회귀를 표시합니다.
 - `--trail A1`은 원본 줄을 그대로 출력합니다. 요약을 믿기 전에 원본을 읽으라는 스킬 원칙을 따릅니다.
+- `--strict`는 Gate failures가 하나라도 있으면 exit 1입니다.
 
 ---
 
 ## 5. 지표와 통과 기준
 
-기준은 `lib-10k`의 median입니다. `lib-20k`에는 "stall ≥250ms가 0회"만 강제합니다.
+게이트는 `lib-10k`에만 적용합니다. `lib-20k`는 `stalls≥250`, A의 `worstStall<250`, C5의 `growMaxMs`/`stalls100`만 적용하고, `lib-5k`는 보고만 합니다.
 
 | 군 | 지표 | PASS |
 |---|---|---|
@@ -295,7 +298,7 @@ xcrun xctrace export --input … --xpath '/trace-toc/run[@number="1"]/data/table
 
 - **역할**: Animation Hitches는 렌더 서버 쪽 히치까지 잡아 ③을 교차 검증합니다. Hangs는 watchdog 수치를 교차 검증합니다. Time Profiler는 정지 구간의 실제 프레임(SwiftUI graph update, NSTableView insert 등)을 보여줍니다. ④의 signpost가 같은 타임라인에 시나리오 구간을 표시합니다.
 - **주의 1**: `--launch`나 `--attach`에는 `get-task-allow`가 필요합니다. Debug 빌드는 보통 문제없습니다. `CODE_SIGNING_ALLOWED=NO` 빌드는 entitlement가 없어 샌드박스가 꺼지므로 경로와 동작이 서명 빌드와 다릅니다. before와 after는 반드시 같은 방식으로 빌드합니다.
-- **주의 2**: Debug(-Onone)는 앱 코드 비용을 부풀립니다. 판정은 Debug 로그의 before/after 비교로 하고, 최종 확인으로 Release에서 Hangs를 한 번 측정합니다. 이 경우 드라이버가 DEBUG 전용이라 A1/B2를 손으로 재현합니다.
+- **주의 2**: 기본 Debug(`-Onone`)는 앱 코드 비용을 부풀립니다. 자동화 판정용 before/after는 `make perf-build`의 최적화된 Debug(`-O`)로 측정합니다. 최종 확인으로 Release에서 Hangs를 한 번 측정하며, 이 경우 드라이버가 DEBUG 전용이라 A1/B2를 손으로 재현합니다.
 - 헤드리스로 돌리려면 GUI 세션이 로그인된 상태여야 합니다(앱이 창을 띄우기 때문). SSH만으로는 불가능합니다.
 
 ---

@@ -77,9 +77,10 @@ public enum MainThreadLog {
         let diff = MainThreadProbe.shared.endScenario(since: current.probe)
         let stalls = diff.stalls.map { $0 * 1000 }
 
-        // Frame statistics cover the active window only (plus the frame that was
-        // in flight when it closed), so an idle tail cannot dilute them.
-        let active = current.frames.filter { $0.at <= activeUntil + $0.expected / 1000 }
+        // Frame statistics cover frames that started inside the active window.
+        // A callback delivered after a long main-thread stall must still retain
+        // the in-flight frame that exposes that stall.
+        let active = current.frames.filter { $0.at - $0.ms / 1000 <= activeUntil }
         let deltas = active.map(\.ms).sorted()
         var dropped = 0
         var hitchMs = 0.0
@@ -195,7 +196,7 @@ public enum MainThreadLog {
     public static func addOncePerTurn(_ label: String) {
         guard countedThisTurn.insert(label).inserted else { return }
         add(label, ms: 0)
-        RunLoop.main.perform {
+        RunLoop.main.perform(inModes: [.common]) {
             MainActor.assumeIsolated { _ = MainThreadLog.countedThisTurn.remove(label) }
         }
     }

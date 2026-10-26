@@ -14,10 +14,14 @@ BUILD_FLAGS := CODE_SIGNING_ALLOWED=NO
 # project in Xcode still shows the prompt once — click "Trust & Enable".
 PLUGIN_FLAGS := -skipPackagePluginValidation
 
-.PHONY: build clean open legibility legibility-check app-store-screenshots app-store-capture app-store-check-faces macos-signing-secrets
+.PHONY: build perf-build clean open legibility legibility-check app-store-screenshots app-store-capture app-store-check-faces macos-signing-secrets
 
 build:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DESTINATION)' -derivedDataPath $(DERIVED_DATA_PATH) $(PLUGIN_FLAGS) $(BUILD_FLAGS) build
+
+# Keep DEBUG instrumentation while measuring optimized application code.
+perf-build:
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DESTINATION)' -derivedDataPath $(DERIVED_DATA_PATH) $(PLUGIN_FLAGS) $(BUILD_FLAGS) SWIFT_OPTIMIZATION_LEVEL=-O build
 
 clean:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -derivedDataPath $(DERIVED_DATA_PATH) clean
