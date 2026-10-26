@@ -78,7 +78,7 @@ TOGGLE_COUNTS = {"D2": 20, "D3": 20, "D4": 1, "D5": 20}
 VARIANTS = ("none", "trickle", "burst", "big1")
 LOG_NAME = re.compile(r"-(?P<variant>none|trickle|burst|big1)-\d+\.log$")
 SCENARIO_BEGIN = re.compile(r"\bscenario\.begin\s+(?P<fields>.*)$")
-NON_METRICS = {"frames", "rep", "cold", "toggles", "dur", "activeDur"}
+NON_METRICS = {"frames", "rep", "cold", "toggles", "dur", "activeDur", "sel"}
 # measurement.md §4: a run (driver.error) or rep (timeouts) that logged one of
 # these is invalid. PerfDriver logs settle.timeout before the rep's
 # scenario.begin and quiesce.timeout before its stats, both with id=; the
@@ -192,6 +192,27 @@ SELF_GATES = {
     "perf-runs/g/lib-20k-refresh-B1-none-1.log": """\
 0 run.begin lib=lib-20k
 1 scenario.stats id=B1 rep=1 cold=0 stalls250=1 stalls100=3 mergeChangedNoNew=9 publish=4
+""",
+}
+
+# Scope regressions from review round 4. These values exceed a nearby gate but
+# belong to a library/step where measurement.md does not set that gate.
+SELF_GATE_SCOPE = {
+    "perf-runs/g/lib-5k-switch-none-1.log": """\
+0 run.begin lib=lib-5k
+1 scenario.stats id=A2 rep=1 cold=0 worstStall=150
+""",
+    "perf-runs/g/lib-20k-scroll-none-1.log": """\
+0 run.begin lib=lib-20k
+1 scenario.stats id=C1 rep=1 cold=0 hitchRatio=7
+""",
+    "perf-runs/g/lib-10k-switch-none-2.log": """\
+0 run.begin lib=lib-10k
+1 scenario.stats id=A14 rep=1 cold=0 publishRows=549 publish=1 rowcontent=1098
+""",
+    "perf-runs/g/lib-10k-toggle-none-2.log": """\
+0 run.begin lib=lib-10k
+1 scenario.stats id=D5 rep=1 cold=0 readerTTFR=300
 """,
 }
 
@@ -396,13 +417,32 @@ def metric(summary: dict, scenario: str, library: str, variant: str, name: str) 
     return chosen.get("warm", {}).get(name)
 
 
-def threshold_for(scenario: str, library: str, name: str, variant: str = "none") -> tuple[float | None, float | None, str] | None:
-    # 20k enforces only stalls≥250 = 0 (and A worstStall <250), except the C
-    # group, which measurement.md §5/§7 judge on 20k as well (C5).
-    if library == "20k" and scenario[0] != "C":
+def threshold_for(scenario: str, library: str, name: str, variant: str = "none",
+                  selection: dict[str, float] | None = None) -> tuple[float | None, float | None, str] | None:
+    if library not in ("10k", "20k"):
+        return None
+    # 20k enforces stalls≥250 everywhere, A worstStall <250, and the two C5
+    # gates called out by the §7 results table. All other §5 gates are 10k-only.
+    if library == "20k":
         if name == "stalls250":
             return (0, 0, "stalls≥250 = 0")
-        return (None, 250.0, "<250") if (scenario[0], name) == ("A", "worstStall") else None
+        if (scenario[0], name) == ("A", "worstStall"):
+            return (None, 250.0, "<250")
+        if scenario == "C5" and name in ("growMaxMs", "stalls100"):
+            return THRESHOLDS[f"C.{name}"]
+        return None
+    # A14 selects row 499 before switching. Until stats expose sel=, applying
+    # the fixed A1 window would reject the correct selection-preserving window.
+    if scenario == "A14" and name in ("publishRows", "rowcontentPerPublish"):
+        if not selection:
+            return None
+        median_window = max(200.0, selection["median"] + 50.0)
+        worst_window = max(200.0, selection["worst"] + 50.0)
+        scale = 1.0 if name == "publishRows" else 2.0
+        median_limit, worst_limit = scale * median_window, scale * worst_window
+        return (median_limit, worst_limit,
+                f"≤{fmt(worst_limit)} (sel+50 window)" if name == "publishRows"
+                else f"≤{fmt(worst_limit)} (2×window)")
     # B1's zero-publish/zero-changed gates assume no new items, i.e. `none`.
     if name in ("publish", "mergeChangedNoNew") and scenario == "B1":
         return ((0, 0, "0") if name == "publish" else THRESHOLDS["B.mergeChangedNoNew"]) if variant in ("none", "-") else None
@@ -412,12 +452,14 @@ def threshold_for(scenario: str, library: str, name: str, variant: str = "none")
         return (0, 0, "0 (D1)")
     if (scenario, name) == ("D5", "hlcTickPerToggle"):
         return (1, 1, "1 per open (D5)")
+    if name == "readerTTFR" and scenario != "D1":
+        return None
     return THRESHOLDS.get(f"{scenario[0]}.{name}")
 
 
 def verdict(scenario: str, library: str, name: str, stats: dict[str, float] | None,
-            variant: str = "none") -> tuple[str, str]:
-    threshold = threshold_for(scenario, library, name, variant)
+            variant: str = "none", selection: dict[str, float] | None = None) -> tuple[str, str]:
+    threshold = threshold_for(scenario, library, name, variant, selection)
     if not threshold:
         return ("–", "–")
     median_limit, worst_limit, label = threshold
@@ -441,13 +483,15 @@ def gate_failures(summary: dict) -> list[str]:
         for library in sorted(summary[scenario]):
             for variant in sorted(summary[scenario][library]):
                 kinds = summary[scenario][library][variant]
-                for name, stats in sorted(kinds.get("warm", {}).items()):
-                    threshold, status = verdict(scenario, library, name, stats, variant)
+                warm = kinds.get("warm", {})
+                selection = warm.get("sel")
+                for name, stats in sorted(warm.items()):
+                    threshold, status = verdict(scenario, library, name, stats, variant, selection)
                     if status == "FAIL":
                         failures.append(f"{scenario}/{library}/{variant} {name}: "
                                         f"{fmt(stats['median'])} / {fmt(stats['worst'])} (기준 {threshold})")
                 cold = kinds.get("cold", {}).get("ttfr")
-                if cold and cold["worst"] > 400:
+                if library == "10k" and scenario == "A1" and cold and cold["worst"] > 400:
                     failures.append(f"{scenario}/{library}/{variant} cold ttfr: "
                                     f"{fmt(cold['median'])} / {fmt(cold['worst'])} (기준 ≤400)")
     return failures
@@ -663,6 +707,42 @@ def selftest() -> None:
     gated = compare(summarize([]), summarize(gate_records), [], [])
     assert f"Gate failures ({len(expected)}):" in gated and "- D5/10k/none hlcTickPerToggle: 2 / 2" in gated, gated
 
+    # Gate scope: 5k is reported only; 20k has stalls250, A worstStall, and
+    # C5 growMaxMs/stalls100 only. A14's selection-sized window waits for sel=,
+    # and readerTTFR is a D1-only gate.
+    scope_records = [record for path, text in SELF_GATE_SCOPE.items() for record in parse_text(text, path)[0]]
+    assert gate_failures(summarize(scope_records)) == []
+    assert threshold_for("A2", "5k", "worstStall") is None
+    assert threshold_for("C1", "20k", "hitchRatio") is None
+    assert threshold_for("A14", "10k", "publishRows") is None
+    assert threshold_for("D5", "10k", "readerTTFR") is None
+
+    scoped_failures, _ = parse_text("""\
+0 run.begin lib=lib-20k
+1 scenario.stats id=A2 rep=1 cold=0 worstStall=300 stalls250=1
+2 scenario.stats id=C5 rep=1 cold=0 growMaxMs=9 stalls100=1
+""", "perf-runs/g/lib-20k-mixed-none-1.log")
+    assert {failure.split(":")[0] for failure in gate_failures(summarize(scoped_failures))} == {
+        "A2/20k/none stalls250", "A2/20k/none worstStall",
+        "C5/20k/none growMaxMs", "C5/20k/none stalls100",
+    }
+
+    selected_records, _ = parse_text("""\
+0 run.begin lib=lib-10k
+1 scenario.stats id=A14 rep=1 cold=0 sel=499 publish=1 publishRows=550 rowcontent=1099
+""", "perf-runs/g/lib-10k-switch-none-3.log")
+    selected_failures = gate_failures(summarize(selected_records))
+    assert {failure.split(":")[0] for failure in selected_failures} == {
+        "A14/10k/none publishRows", "A14/10k/none rowcontentPerPublish",
+    }
+    assert "기준 ≤549 (sel+50 window)" in selected_failures[0]
+
+    d1_records, _ = parse_text(
+        "0 run.begin lib=lib-10k\n1 scenario.stats id=D1 rep=1 cold=0 readerTTFR=300",
+        "perf-runs/g/lib-10k-toggle-none-3.log",
+    )
+    assert gate_failures(summarize(d1_records))[0].startswith("D1/10k/none readerTTFR:")
+
     # --strict: exit 1 on any gate failure, 0 without the flag or when all pass.
     with tempfile.TemporaryDirectory() as directory:
         failing = pathlib.Path(directory, "lib-10k-switch-none-1.log")
@@ -676,6 +756,10 @@ def selftest() -> None:
         assert exit_code(str(failing)) == 0
         assert exit_code(str(passing), "--strict") == 0
         assert exit_code("--compare", str(passing), str(failing), "--strict") == 1
+        for index, text in enumerate(SELF_GATE_SCOPE.values()):
+            scoped = pathlib.Path(directory, f"scope-{index}.log")
+            scoped.write_text(text)
+            assert exit_code(str(scoped), "--strict") == 0
     print("perfreport selftest: PASS")
     print(report)
 
