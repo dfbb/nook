@@ -26,8 +26,7 @@ PERF_DERIVED_DATA_PATH := DerivedData-perf
 
 perf-build:
 	@set -eu; \
-	stamp="$$(git rev-parse HEAD)"; \
-	if test -n "$$(git status --porcelain --untracked-files=no)"; then stamp="$$stamp-dirty"; fi; \
+	stamp="$$(tools/perf/build-id.sh)"; \
 	plist="$(PERF_DERIVED_DATA_PATH)/Build/Products/Debug/Nook.app/Contents/Info.plist"; \
 	/usr/libexec/PlistBuddy -c 'Delete :NookBuildSHA' "$$plist" >/dev/null 2>&1 || true; \
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug -destination '$(DESTINATION)' -derivedDataPath $(PERF_DERIVED_DATA_PATH) $(PLUGIN_FLAGS) $(BUILD_FLAGS) SWIFT_OPTIMIZATION_LEVEL=-O build; \

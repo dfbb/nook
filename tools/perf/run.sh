@@ -66,13 +66,10 @@ if [[ -n "$team" && "$team" != "not set" ]]; then
 fi
 # Only make perf-build stamps its DEBUG product, including incremental builds.
 # Compare build identity, not mtimes or strings predating the Keychain guards.
-sha="$(git -C "$repo_root" rev-parse HEAD)"
-if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]]; then
-  sha="${sha}-dirty"
-fi
+sha="$("$repo_root/tools/perf/build-id.sh")"
 binary_sha="$(/usr/libexec/PlistBuddy -c 'Print :NookBuildSHA' "$app/Contents/Info.plist" 2>/dev/null || true)"
 if [[ "$binary_sha" != "$sha" ]]; then
-  echo "refusing unstamped or stale perf build: binarySha=${binary_sha:-missing} HEAD=$sha (run make perf-build)" >&2
+  echo "refusing unstamped or stale perf build: binarySha=${binary_sha:-missing} checkout=$sha (run make perf-build)" >&2
   exit 2
 fi
 
@@ -234,7 +231,6 @@ child_pid=""
 trace_status=0
 if [[ -n "$trace_pid" ]]; then
   stop_trace || trace_status=$?
-  if [[ "$status" -eq 0 && "$trace_status" -ne 0 ]]; then status=$trace_status; fi
 fi
 
 if [[ -f "$source_log" ]]; then mv "$source_log" "$destination"; else touch "$destination"; fi
@@ -247,8 +243,12 @@ elif (( status > 128 || trace_status > 128 )); then
   echo "child or trace was killed by a signal; see $destination" >&2
   status=1
 elif [[ "$status" -ne 0 ]]; then
-  echo "perf.driver.error reason=child-exit status=$status" >>"$destination"
+  echo "perf.driver.error reason=child-exit status=$status traceStatus=$trace_status" >>"$destination"
   echo "child exited with status $status; see $launch_tmp/stderr.log" >&2
+elif [[ "$trace_status" -ne 0 ]]; then
+  echo "perf.driver.error reason=trace-exit traceStatus=$trace_status" >>"$destination"
+  echo "xctrace exited with status $trace_status (the app exited 0); see $destination" >&2
+  status=$trace_status
 elif ! grep -q 'perf\.library' "$destination"; then
   echo "perf.driver.error reason=missing-library" >>"$destination"
   echo "no perf.library in the log; see $launch_tmp/stderr.log" >&2
@@ -261,6 +261,6 @@ if grep -q 'perf\.driver\.error' "$destination"; then exit 1; fi
 # -Onone inflates app-code cost several times; keep it out of -O results.
 opt="$(sed -n 's/.*run\.begin.* opt=\([^ ]*\).*/\1/p' "$destination" | tail -1)"
 if [[ "$opt" != "-O" ]]; then
-  echo "warning: this run was built with opt=${opt:-unknown}, not -O; measure with make perf-build" >&2
-  [[ "${NOOK_PERF_ALLOW_ONONE:-0}" == "1" ]] || exit 1
+  echo "error: this run was built with opt=${opt:-unknown}, not -O; measure with make perf-build" >&2
+  exit 1
 fi

@@ -35,7 +35,7 @@
 **① 시나리오 마커와 통계** (`MainThreadLog`에 추가)
 - `scenarioBegin(name:)`은 `totals` 스냅샷, stall 목록 길이, 프레임 카운터를 저장합니다.
 - `scenarioEnd()`는 그 차이를 한 줄로 기록합니다(줄 형식은 4절).
-- 시작할 때 한 번 `run.begin label=<NookPerfLabel> sha=<git> binarySha=<built git> lib=<id> hz=<display Hz> opt=<-O|-Onone> log=<MainThreadLog.url>`를 남깁니다. `opt`는 컴파일 시점에 정해지는 `_isDebugAssertConfiguration()`에서 옵니다.
+- 시작할 때 한 번 `run.begin label=<NookPerfLabel> sha=<build-id.sh> binarySha=<NookBuildSHA> lib=<id> hz=<display Hz> opt=<-O|-Onone> log=<MainThreadLog.url>`를 남깁니다. `opt`는 컴파일 시점에 정해지는 `_isDebugAssertConfiguration()`에서 옵니다.
 - 로그 경로는 서명/샌드박스 여부에 따라 바뀝니다. `CODE_SIGNING_ALLOWED=NO` 빌드는 entitlement가 없어 컨테이너 밖 `$TMPDIR`에 씁니다. 그래서 경로를 추측하지 말고 로그에 찍힌 `log=` 값을 씁니다.
 
 **② Watchdog을 촘촘하게**
@@ -185,7 +185,7 @@ B 스크립트는 변형별로 나뉘고 `repetitions:1`입니다: `refresh-none
 - **서명 안 된 빌드의 Keychain 프롬프트.** `ContentView.init`이 만드는 `PlusStore`가 `PlusCredential.current`(`SecItemCopyMatching`)를 읽다가, 아무도 응답하지 않는 Keychain 접근 프롬프트에서 메인 스레드가 멈췄습니다. `-NookPerfLibrary`가 있으면(`PerfLaunch.isActive`) `PlusCredential.current`와 `GeminiCredential.apiKey`는 Keychain을 건드리지 않고 nil을 돌려줍니다. 그러면 Plus 호출이 `.sessionInvalid`로 실패해 sign-out을 부르므로, 쓰기 경로(`PlusCredential.store`/`signOut`, `GeminiCredential.setAPIKey`, `PlusOwnFeed.remember`, 로컬 앱 초기화)도 perf 실행에서는 아무것도 하지 않거나 실패합니다. 실제 Keychain 항목과 그 UserDefaults 플래그는 지워지지도 다시 쓰이지도 않습니다.
 - **초기 창 없음.** 저장된 앱 상태 없이 직접 실행한 자식은 `Window("main")`을 받지 못했습니다. 실행 1초 뒤에도 보이는 창이 없으면 DEBUG launch hook이 자기 프로세스에 `kAEReopenApplication`(Dock 클릭과 같은 이벤트)을 보내고, 3초에 한 번 더 시도합니다. 창은 SwiftUI의 기본 reopen 처리로 열리고, `Window`는 단일 인스턴스라 두 번째 창이 생기지 않습니다.
 
-run.sh는 `/Applications/Nook.app`, 저장소 밖의 앱(`NOOK_PERF_ALLOW_EXTERNAL_APP=1`이 없으면), 팀 서명된 앱, 현재 HEAD와 dirty 상태에 맞는 perf-build stamp가 없는 빌드를 띄우지 않습니다. `make perf-build`는 incremental build에서도 Debug 결과물의 Info.plist에 전체 SHA와 dirty 상태를 `NookBuildSHA`로 기록하고, 앱이 이를 `run.begin binarySha=`로 읽습니다. 커밋(문서만 바뀐 경우 포함)이나 소스 수정 뒤에는 다시 빌드합니다. dirty 플래그는 미커밋 수정 내용 자체의 해시가 아닙니다. 경로 비교에는 심볼릭 링크를 해소한 실제 경로를 씁니다. 실행마다 `perf-runs/.work/<label>/launch.XXXXXX/`에 `stdout.log`/`stderr.log`가 남고, 실패 메시지가 그 `stderr.log`를 알려줍니다.
+run.sh는 `/Applications/Nook.app`, 저장소 밖의 앱(`NOOK_PERF_ALLOW_EXTERNAL_APP=1`이 없으면), 팀 서명된 앱, 현재 HEAD와 dirty 상태에 맞는 perf-build stamp가 없는 빌드를 띄우지 않습니다. `make perf-build`는 incremental build에서도 Debug 결과물의 Info.plist에 `tools/perf/build-id.sh`가 계산한 체크아웃 식별자를 `NookBuildSHA`로 기록하고, 앱이 이를 `run.begin binarySha=`로 읽습니다. 깨끗한 트리면 전체 HEAD SHA이고, 아니면 `<HEAD>-dirty-<12 hex>`입니다. 이 hex는 `git diff HEAD --binary`와 ignore되지 않은 untracked 파일의 경로·내용을 합친 SHA-256이라 미커밋 수정 내용과 새 파일(NookKit과 synchronized 폴더는 untracked 파일도 컴파일합니다)까지 구분합니다. run.sh는 같은 스크립트로 식별자를 계산해 `-NookPerfSHA`로 넘기므로 `sha=`와 `binarySha=`를 그대로 비교할 수 있습니다. 커밋(문서만 바뀐 경우 포함), 소스 수정, untracked 파일 추가·삭제 뒤에는 다시 빌드합니다. 경로 비교에는 심볼릭 링크를 해소한 실제 경로를 씁니다. 실행마다 `perf-runs/.work/<label>/launch.XXXXXX/`에 `stdout.log`/`stderr.log`가 남고, 실패 메시지가 그 `stderr.log`를 알려줍니다.
 
 perf 모드의 `UpdateController`는 pending update를 읽거나 Sparkle을 생성하기 전에 반환하므로 appcast fetch, 업데이트 chip, Sparkle의 SU* 및 pending-update defaults 쓰기가 없습니다. `@AppStorage`나 sort order 같은 나머지 defaults 쓰기는 서명 안 된 개발 빌드의 preferences 도메인에 생길 수 있으며, 설치된 sandbox 앱의 container 도메인과는 별개입니다.
 
@@ -195,14 +195,14 @@ run-all은 자신의 INT/TERM trap이 실행된 경우에만 전체 matrix를 �
 - 같은 머신, 전원 연결, 다른 앱 종료, Low Power 꺼짐
 - 실행 전 `pmset -g therm`이 정상인지 확인
 - 디스플레이 Hz를 `run.begin`에 기록합니다. ProMotion이면 120Hz와 60Hz를 섞어서 비교하지 않습니다.
-- before와 after는 모두 `make perf-build`로 빌드하고 같은 서명 여부로 측정합니다. 이 타깃은 DEBUG 계측을 유지하면서 Swift 앱 코드를 `-O`로 최적화하므로, `-Onone`이 대형 SwiftUI 목록 비용을 과장해 비교 실행을 수십 초씩 늘리는 문제를 피합니다. 결과물은 `DerivedData-perf/`에 따로 쌓이므로 `make build`(`-Onone`, `DerivedData/`)가 덮어쓰지 않고, run.sh는 기본으로 이 앱을 띄웁니다. 실행 로그의 `run.begin opt=`가 `-O`가 아니면 run.sh는 경고와 함께 실패하고(`NOOK_PERF_ALLOW_ONONE=1`로만 통과), perfreport는 opt가 섞인 실행을 요약하거나 비교하지 않습니다.
+- before와 after는 모두 `make perf-build`로 빌드하고 같은 서명 여부로 측정합니다. 이 타깃은 DEBUG 계측을 유지하면서 Swift 앱 코드를 `-O`로 최적화하므로, `-Onone`이 대형 SwiftUI 목록 비용을 과장해 비교 실행을 수십 초씩 늘리는 문제를 피합니다. 결과물은 `DerivedData-perf/`에 따로 쌓이므로 `make build`(`-Onone`, `DerivedData/`)가 덮어쓰지 않고, run.sh는 기본으로 이 앱을 띄웁니다. 실행 로그의 `run.begin opt=`가 `-O`가 아니면 run.sh는 실패하고(stamp 검사에 이은 이중 방어입니다), perfreport는 opt가 섞인 실행을 요약하거나 비교하지 않습니다.
 
 ---
 
 ## 4. 로그 형식과 집계
 
 ```
-<t> run.begin        label=before-ebd5ee6 sha=ebd5ee6 lib=lib-10k hz=120 opt=-O log=/…/ui-forensics.log
+<t> run.begin        label=before-ebd5ee6 sha=ebd5ee6c0d6b1f4e9a2c3b7d8e5f60718293a4b5 binarySha=ebd5ee6c0d6b1f4e9a2c3b7d8e5f60718293a4b5 lib=lib-10k hz=120 opt=-O log=/…/ui-forensics.log
 <t> perf.replica     dir=/…/lib-10k/.nook-perf-replica/
 <t> perf.library     articles=10000 unread=6000 starred=200 feeds=300
 <t> perf.layout      window=1440x900 listWidth=420 columns=0+270,0+691,692+748

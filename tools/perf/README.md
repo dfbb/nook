@@ -51,22 +51,25 @@ add a localhost development exception before using refresh scenarios.
 Build first with `make perf-build`: DEBUG instrumentation with `-O` app code,
 in its own `DerivedData-perf/` so `make build` (`-Onone`) never replaces it.
 `run.sh` launches that app (`NOOK_PERF_APP` overrides the path). `run.begin`
-logs `opt=-O|-Onone`; after the run, `run.sh` warns and exits 1 on anything
-but `-O` unless `NOOK_PERF_ALLOW_ONONE=1`, and perfreport refuses to summarize
-or compare runs whose opt levels differ.
+logs `opt=-O|-Onone`; after the run, `run.sh` exits 1 on anything but `-O`
+(defence in depth, since only `make perf-build` stamps a launchable app), and
+perfreport refuses to summarize or compare runs whose opt levels differ.
 
 A single run takes a label (`[A-Za-z0-9._-]`,
 no leading dot), library (a generated name or directory), driver JSON, and
 optional feed variant. `--only ID[,ID]` runs just those steps
 (`-NookPerfOnly`) and adds the ids to the log name. Port 8765 must be free; the runner refuses to start
-next to a stale feed server. `make perf-build` stamps the full HEAD SHA plus
-`-dirty` when tracked changes exist into the built Debug Info.plist's
-`NookBuildSHA`, even when an incremental build does not relink. The runner
-refuses a missing stamp or one that differs from the current HEAD and dirty
-flag; rebuild after every commit (including docs-only commits) or source edit.
-The dirty flag does not fingerprint uncommitted edits. `-NookPerfSHA` carries
-the current checkout identity, and `run.begin binarySha=` reads the build stamp
-directly from the app bundle. Each child receives an explicit `-NookPerfLog` path beneath
+next to a stale feed server. `make perf-build` stamps the checkout identity
+from `tools/perf/build-id.sh` into the built Debug Info.plist's `NookBuildSHA`,
+even when an incremental build does not relink: the full HEAD SHA on a clean
+tree, or `<HEAD>-dirty-<12 hex>` otherwise, where the hex is a SHA-256 over
+`git diff HEAD --binary` plus the paths and contents of untracked, non-ignored
+files (NookKit and the synchronized extension folders compile untracked files).
+The runner computes the same identity and refuses a missing or different stamp;
+rebuild after every commit (including docs-only commits) or source edit, and
+after adding or removing an untracked file. `-NookPerfSHA` carries that same
+checkout identity, and `run.begin binarySha=` reads the build stamp directly
+from the app bundle, so the two stay comparable. Each child receives an explicit `-NookPerfLog` path beneath
 `perf-runs/.work/<label>/` (Foundation may ignore `TMPDIR`); its log is archived as
 `perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`. The runner never reads or
 moves the real Nook container log or changes the installed app's defaults.
