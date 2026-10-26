@@ -61,10 +61,38 @@ optional feed variant. `--only ID[,ID]` runs just those steps
 (`-NookPerfOnly`) and adds the ids to the log name. Port 8765 must be free; the runner refuses to start
 next to a stale feed server. It passes `-NookPerfSHA` with the current short
 HEAD plus `-dirty` when tracked changes exist, and warns if the app binary is
-older than HEAD. It archives an earlier `ui-forensics.log` from the process temp
-directory; the real Nook container is checked only for a signed build, and each
-move is printed. Archived logs go to `perf-runs/.work/<label>/archived-logs`; it saves the
-launch's log as `perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`:
+older than HEAD. Each child receives an explicit `-NookPerfLog` path beneath
+`perf-runs/.work/<label>/` (Foundation may ignore `TMPDIR`); its log is archived as
+`perf-runs/<label>/<lib>-<script>-<variant>-<n>.log`. The runner never reads or
+moves the real Nook container log or changes the installed app's defaults.
+
+The runner executes `Nook.app/Contents/MacOS/Nook` directly as its child and
+waits for that PID. Round 3 observed `open -n -W` hang 3/3 times after
+`run.begin`, with zero windows and no `perf.library`, while the same binary
+and arguments worked directly. The installed app and its live widget share
+`com.tim.nook` with this build: Launch Services bundle resolution and restored
+window state are suspected, but the precise macOS cause is unconfirmed.
+The worker also reproduced a zero-window launch with direct execution; a
+noninteractive launching process without the normal WindowServer/GUI context
+is another possible cause. Invoke the runner from a normal logged-in user shell
+when that occurs. Direct execution bypasses Launch Services and the runner disables saved-window
+restoration for this launch via argument-domain defaults; the DEBUG launch hook
+sets the current process activation policy to regular and activates it when
+`-NookPerfScript` is present. The driver orders its own
+window front and calls `NSApp.activate(ignoringOtherApps: true)` without any
+bundle-id lookup. The DEBUG logger also accepts `NOOK_PERF_LOG_PATH`, with
+`-NookPerfLog` taking precedence; absent either override, its usual path is
+unchanged. Release behavior is unchanged.
+
+A watchdog requires `perf.library` within 60 seconds and caps the whole child
+at 600 seconds (switch/scroll/toggle/misc) or 300 seconds (`refresh*.json`).
+`NOOK_PERF_LIBRARY_TIMEOUT_SECONDS` and `NOOK_PERF_RUN_TIMEOUT_SECONDS` override
+those positive-integer limits for testing. On timeout it terminates only its
+child PID, escalates to SIGKILL after one second, appends
+`perf.driver.error reason=launch-timeout` to the archived log (even if no app
+log exists), and exits 124. Other child/driver failures also exit nonzero.
+`--xctrace` attaches to the same child PID and stops the recording when the
+child exits, so it omits the very earliest launch activity.
 
 ```sh
 tools/perf/run.sh before-$(git rev-parse --short HEAD) lib-10k tools/perf/scripts/switch.json none
@@ -101,7 +129,9 @@ tools/perf/run-all.sh before-$(git rev-parse --short HEAD)
 
 `run-all.sh` refuses a label whose `perf-runs/<label>` directory is non-empty,
 so a retry cannot silently mix more than five repetitions into a median. Use a
-new label after an interrupted matrix. B3 and E3 wait for ambient refresh to
+new label after an interrupted matrix. A failed launch skips the remaining
+launches in that group; other groups continue. The final `groups.txt` summary
+records every group outcome, and any failure makes run-all exit 1. B3 and E3 wait for ambient refresh to
 finish; with 300 feeds, two fetches at a time, and the deterministic 50–800 ms
 latency they normally take about 65 seconds each. An interactive six-at-a-time
 refresh is about 21 seconds; the full matrix is typically 45–90 minutes (and can

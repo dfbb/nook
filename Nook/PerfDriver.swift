@@ -31,6 +31,16 @@ final class PerfDriver {
     static let shared = PerfDriver()
     private var didRun = false
 
+    /// Direct child launches may begin without a foreground activation event.
+    /// This acts on this process only, even if the installed app shares its id.
+    static func prepareLaunchIfRequested() {
+        guard ProcessInfo.processInfo.arguments.contains("-NookPerfScript") else { return }
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        MainThreadLog.note("perf.activation", extra: "pid=\(ProcessInfo.processInfo.processIdentifier) windows=\(NSApp.windows.count) policy=\(NSApp.activationPolicy().rawValue)")
+        MainThreadLog.flush()
+    }
+
     private struct Script: Decodable {
         var repetitions: Int?
         var coldFirst: Bool?
@@ -59,6 +69,8 @@ final class PerfDriver {
     func runIfRequested(store: ReaderStore) async {
         guard !didRun, let path = launchValue("-NookPerfScript") else { return }
         didRun = true
+        // Publish perf.library before the first potentially long scenario.
+        MainThreadLog.flush()
         do {
             let script = try JSONDecoder().decode(Script.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
             let only = launchValue("-NookPerfOnly").map {
@@ -315,7 +327,7 @@ final class PerfDriver {
         window.setContentSize(NSSize(width: 1440, height: 900))
         window.center()
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
+        NSApp.activate(ignoringOtherApps: true)
         // Let the resize lay out before the dividers are placed against it.
         try await Task.sleep(for: .milliseconds(300))
         guard let splitView = Self.outerSplitView(in: window.contentView), splitView.arrangedSubviews.count >= 3 else {

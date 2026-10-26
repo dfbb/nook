@@ -42,7 +42,7 @@ if [[ ${#refresh_scripts[@]} -ne 0 && ${#refresh_scripts[@]} -ne 3 ]]; then
   exit 1
 fi
 [[ ${#refresh_scripts[@]} -eq 3 || -f "$script_dir/refresh.json" ]] || { echo "missing $script_dir/refresh-{none,trickle,big1}.json (or legacy refresh.json)" >&2; exit 1; }
-mkdir -p "$derived_dir"
+mkdir -p "$derived_dir" "$run_dir"
 
 # Writes a copy of <group>.json. Mode except drops the given step ids; mode
 # single keeps every step and forces one repetition with no cold rep, and
@@ -50,7 +50,7 @@ mkdir -p "$derived_dir"
 derive() {
   local group="$1" name="$2" mode="$3"
   shift 3
-  python3 - "$script_dir/$group.json" "$derived_dir/$name.json" "$mode" "$@" <<'PY'
+  python3 - "$script_dir/$group.json" "$derived_dir/$name.json" "$mode" "$@" <<'PY' || return $?
 import json, sys
 source, target, mode, *ids = sys.argv[1:]
 script = json.load(open(source))
@@ -88,39 +88,63 @@ run_only() {
 run_per_rep() {
   local group="$1" step="$2" lib="$3" variant="$4"
   local script
-  script="$(derive "$group" "$group-single" single)"
-  for _ in $(seq "$reps"); do run_only "$step" "$lib" "$script" "$variant"; done
+  script="$(derive "$group" "$group-single" single)" || return $?
+  for _ in $(seq "$reps"); do run_only "$step" "$lib" "$script" "$variant" || return $?; done
 }
 
-# Library and variant coverage follows measurement.md §3/§5.
-for lib in lib-5k lib-10k lib-20k; do run "$lib" "$script_dir/switch.json" none; done
-
+# A failed launch aborts its group; independent groups still run.
 step_ids() {
   python3 -c 'import json, sys; print(" ".join(step["id"] for step in json.load(open(sys.argv[1]))["steps"]))' "$script_dir/$1.json"
 }
-if [[ ${#refresh_scripts[@]} -gt 0 ]]; then
-  # Each step still gets its own launches: in refresh-trickle.json, B2 would
-  # otherwise consume the new items before B3 and B5 run.
-  for group in "${refresh_scripts[@]}"; do
-    ids="$(step_ids "$group")"
-    for step in $ids; do run_per_rep "$group" "$step" lib-10k "${group#refresh-}"; done
+
+group_switch() {
+  local lib
+  for lib in lib-5k lib-10k lib-20k; do run "$lib" "$script_dir/switch.json" none || return $?; done
+}
+group_refresh() {
+  local group ids step
+  if [[ ${#refresh_scripts[@]} -gt 0 ]]; then
+    for group in "${refresh_scripts[@]}"; do
+      ids="$(step_ids "$group")" || return $?
+      for step in $ids; do run_per_rep "$group" "$step" lib-10k "${group#refresh-}" || return $?; done
+    done
+  else
+    run_per_rep refresh B1 lib-10k none || return $?
+    run_per_rep refresh B2 lib-10k trickle || return $?
+    run_per_rep refresh B3 lib-10k trickle || return $?
+    run_per_rep refresh B4 lib-10k big1 || return $?
+    run_per_rep refresh B5 lib-10k trickle || return $?
+  fi
+}
+group_scroll() {
+  local script lib
+  script="$(derive scroll scroll except C4)" || return $?
+  for lib in lib-10k lib-20k; do
+    run "$lib" "$script" none || return $?
+    run_per_rep scroll C4 "$lib" trickle || return $?
   done
-else
-  run_per_rep refresh B1 lib-10k none
-  run_per_rep refresh B2 lib-10k trickle
-  run_per_rep refresh B3 lib-10k trickle
-  run_per_rep refresh B4 lib-10k big1
-  run_per_rep refresh B5 lib-10k trickle
-fi
+}
+group_toggle() { run lib-10k "$script_dir/toggle.json" none; }
+group_misc() {
+  local script
+  script="$(derive misc misc except E3)" || return $?
+  run lib-10k "$script" none || return $?
+  run_per_rep misc E3 lib-10k trickle
+}
 
-scroll_rest="$(derive scroll scroll except C4)"
-for lib in lib-10k lib-20k; do
-  run "$lib" "$scroll_rest" none
-  run_per_rep scroll C4 "$lib" trickle
+failed=0
+summary="$run_dir/groups.txt"
+for group in switch refresh scroll toggle misc; do
+  if case "$group" in
+    switch) group_switch ;; refresh) group_refresh ;; scroll) group_scroll ;;
+    toggle) group_toggle ;; misc) group_misc ;;
+  esac; then
+    echo "$group: succeeded" | tee -a "$summary"
+  else
+    status=$?
+    echo "$group: failed (exit=$status; remaining launches in group skipped)" | tee -a "$summary" >&2
+    failed=1
+  fi
 done
-
-run lib-10k "$script_dir/toggle.json" none
-
-misc_rest="$(derive misc misc except E3)"
-run lib-10k "$misc_rest" none
-run_per_rep misc E3 lib-10k trickle
+cat "$summary"
+exit "$failed"

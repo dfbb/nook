@@ -28,7 +28,18 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 # NOOK_PERF_ALLOW_ONONE=1 to pass the check after the run.
 app="${NOOK_PERF_APP:-$repo_root/DerivedData-perf/Build/Products/Debug/Nook.app}"
 executable="$app/Contents/MacOS/Nook"
+# Never let an override launch the user's installed app.
+if [[ "$app" -ef /Applications/Nook.app ]]; then
+  echo "refusing to launch the installed /Applications/Nook.app" >&2
+  exit 2
+fi
 port=8765
+library_timeout="${NOOK_PERF_LIBRARY_TIMEOUT_SECONDS:-60}"
+case "$(basename "$script_arg")" in refresh*) default_cap=300 ;; *) default_cap=600 ;; esac
+run_timeout="${NOOK_PERF_RUN_TIMEOUT_SECONDS:-$default_cap}"
+for limit in "$library_timeout" "$run_timeout"; do
+  [[ "$limit" =~ ^[1-9][0-9]*$ ]] || { echo "timeouts must be positive integer seconds" >&2; exit 2; }
+done
 
 # The label becomes a path under perf-runs/ that rsync --delete writes into.
 [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "invalid label (use [A-Za-z0-9._-], no leading dot): $label" >&2; exit 2; }
@@ -41,7 +52,7 @@ else
 fi
 [[ -d "$golden" ]] || { echo "golden library not found: $golden" >&2; exit 1; }
 [[ -f "$script_arg" ]] || { echo "scenario script not found: $script_arg" >&2; exit 1; }
-[[ -d "$app" ]] || { echo "perf app not found: $app (run make perf-build first)" >&2; exit 1; }
+[[ -x "$executable" ]] || { echo "perf app not found: $app (run make perf-build first)" >&2; exit 1; }
 
 lib_name="$(basename "$golden")"
 script_name="$(basename "$script_arg")"
@@ -72,11 +83,29 @@ rsync -a --delete "$golden/" "$working/"
 server_log="$run_dir/feedserver-$lib_name-$script_name-$variant.log"
 python3 "$repo_root/tools/perf/feedserver.py" --root "$feed_root" --port "$port" --latency-seed 7 >"$server_log" 2>&1 &
 server_pid=$!
+child_pid=""
+watchdog_pid=""
+trace_pid=""
+stop_child() {
+  [[ -n "$child_pid" ]] || return 0
+  kill "$child_pid" 2>/dev/null || true
+  # A stuck app may ignore SIGTERM. Target only the child we launched.
+  sleep 1
+  kill -KILL "$child_pid" 2>/dev/null || true
+}
 cleanup() {
+  [[ -z "$trace_pid" ]] || kill -INT "$trace_pid" 2>/dev/null || true
+  [[ -z "$watchdog_pid" ]] || kill "$watchdog_pid" 2>/dev/null || true
+  if [[ -n "$child_pid" ]]; then
+    stop_child
+    wait "$child_pid" 2>/dev/null || true
+  fi
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 server_ready=0
 for _ in {1..50}; do
@@ -103,6 +132,8 @@ if [[ "$head_time" =~ ^[0-9]+$ && "$binary_time" =~ ^[0-9]+$ && "$binary_time" -
   echo "warning: Nook binary is older than HEAD; run make perf-build before trusting sha=$sha" >&2
 fi
 launch_args=(
+  -ApplePersistenceIgnoreState YES
+  -NSQuitAlwaysKeepsWindows NO
   -NookPerfLibrary "$working"
   -NookPerfScript "$(cd "$(dirname "$script_arg")" && pwd)/$(basename "$script_arg")"
   -NookPerfLabel "$label"
@@ -115,65 +146,76 @@ launch_args=(
 )
 [[ -z "$only" ]] || launch_args+=(-NookPerfOnly "$only")
 
-# MainThreadLog appends to NSTemporaryDirectory()/ui-forensics.log: the user
-# temp dir for an unsigned (CODE_SIGNING_ALLOWED=NO) build. The real app
-# container is considered only for a verifiably signed build, avoiding a TCC
-# prompt and the user's own debug log during normal perf runs.
-candidates=()
-for dir in "${TMPDIR:-}" "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"; do
-  [[ -n "$dir" ]] || continue
-  path="${dir%/}/ui-forensics.log"
-  for seen in ${candidates[@]+"${candidates[@]}"}; do [[ "$seen" -ef "$path" || "$seen" == "$path" ]] && continue 2; done
-  candidates+=("$path")
-done
-if codesign --verify "$app" >/dev/null 2>&1; then
-  container_log="$HOME/Library/Containers/com.tim.nook/Data/tmp/ui-forensics.log"
-  candidates+=("$container_log")
-fi
-# Archive any earlier log so the file after this launch holds only this run.
-archive="$repo_root/perf-runs/.work/$label/archived-logs"
-for candidate in "${candidates[@]}"; do
-  if [[ -f "$candidate" ]]; then
-    mkdir -p "$archive"
-    archived="$archive/$(date +%Y%m%d-%H%M%S)-$RANDOM-ui-forensics.log"
-    mv "$candidate" "$archived"
-    echo "archived existing perf log: $candidate -> $archived" >&2
-  fi
-done
-
-if [[ -n "$xctrace_template" ]]; then
-  trace="$run_dir/$lib_name-$script_name-$variant-$(date +%Y%m%d-%H%M%S).trace"
-  xcrun xctrace record --template "$xctrace_template" --output "$trace" --launch -- "$executable" "${launch_args[@]}"
-else
-  open -n -W "$app" --args "${launch_args[@]}"
-fi
-
+# Give this child an explicit log path: macOS Foundation can ignore TMPDIR.
+# Never inspect or move the real app's container log.
+launch_tmp="$(mktemp -d "$working/../launch.XXXXXX")"
+source_log="$launch_tmp/ui-forensics.log"
 n=1
 while [[ -e "$run_dir/$lib_name-$script_name-$variant-$n.log" ]]; do n=$((n + 1)); done
 destination="$run_dir/$lib_name-$script_name-$variant-$n.log"
+timeout_marker="$launch_tmp/timeout"
+launch_args+=(-NookPerfLog "$source_log")
 
-found=0
-for candidate in "${candidates[@]}"; do
-  [[ -f "$candidate" ]] || continue
-  begin="$(grep 'run\.begin' "$candidate" | grep "label=$label " | tail -1 || true)"
-  [[ -n "$begin" ]] || continue
-  # Prefer the path the app declared in run.begin; it is the same file unless
-  # the temp dir resolved differently inside the app.
-  declared="$(printf '%s\n' "$begin" | sed -n 's/.* log=\([^ ]*\).*/\1/p')"
-  [[ -n "$declared" && -f "$declared" ]] || declared="$candidate"
-  mv "$declared" "$destination"
-  found=1
-  break
-done
+TMPDIR="$launch_tmp/" "$executable" "${launch_args[@]}" >"$launch_tmp/stdout.log" 2>"$launch_tmp/stderr.log" &
+child_pid=$!
+if [[ -n "$xctrace_template" ]]; then
+  # Attach by PID so the watchdog always owns the actual app child.
+  trace="$run_dir/$lib_name-$script_name-$variant-$(date +%Y%m%d-%H%M%S).trace"
+  xcrun xctrace record --template "$xctrace_template" --output "$trace" --time-limit "${run_timeout}s" --attach "$child_pid" &
+  trace_pid=$!
+fi
+(
+  started=$SECONDS
+  while kill -0 "$child_pid" 2>/dev/null; do
+    elapsed=$((SECONDS - started))
+    if (( elapsed >= run_timeout )); then
+      echo "total" >"$timeout_marker"
+      break
+    fi
+    if (( elapsed >= library_timeout )) && ! grep -q 'perf\.library' "$source_log" 2>/dev/null; then
+      echo "library" >"$timeout_marker"
+      break
+    fi
+    sleep 1
+  done
+  if [[ -f "$timeout_marker" ]]; then stop_child; fi
+) &
+watchdog_pid=$!
+status=0
+wait "$child_pid" || status=$?
+# Wait for a timeout's TERM/KILL sequence before dropping the child handle.
+if [[ -f "$timeout_marker" ]]; then
+  wait "$watchdog_pid" || true
+else
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+fi
+watchdog_pid=""
+child_pid=""
+if [[ -n "$trace_pid" ]]; then
+  kill -INT "$trace_pid" 2>/dev/null || true
+  trace_status=0
+  wait "$trace_pid" || trace_status=$?
+  trace_pid=""
+  if [[ "$status" -eq 0 && "$trace_status" -ne 0 ]]; then status=$trace_status; fi
+fi
 
-[[ "$found" -eq 1 ]] || {
-  echo "could not locate this launch's ui-forensics.log for label=$label (checked: ${candidates[*]})" >&2
-  exit 1
-}
+if [[ -f "$source_log" ]]; then mv "$source_log" "$destination"; else touch "$destination"; fi
+if [[ -f "$timeout_marker" ]]; then
+  echo "perf.driver.error reason=launch-timeout phase=$(cat "$timeout_marker") libraryLimit=$library_timeout totalLimit=$run_timeout" >>"$destination"
+  echo "launch timed out; see $destination" >&2
+  status=124
+elif [[ "$status" -ne 0 ]]; then
+  echo "perf.driver.error reason=child-exit status=$status" >>"$destination"
+elif ! grep -q 'perf\.library' "$destination"; then
+  echo "perf.driver.error reason=missing-library" >>"$destination"
+  status=1
+fi
 echo "$destination"
+[[ "$status" -eq 0 ]] || exit "$status"
+if grep -q 'perf\.driver\.error' "$destination"; then exit 1; fi
 
-# -Onone inflates app-code cost several times over; such a log must not pass
-# for a perf-build one. perfreport also refuses to compare across opt levels.
+# -Onone inflates app-code cost several times; keep it out of -O results.
 opt="$(sed -n 's/.*run\.begin.* opt=\([^ ]*\).*/\1/p' "$destination" | tail -1)"
 if [[ "$opt" != "-O" ]]; then
   echo "warning: this run was built with opt=${opt:-unknown}, not -O; measure with make perf-build" >&2

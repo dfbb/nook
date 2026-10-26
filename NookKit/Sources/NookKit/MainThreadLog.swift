@@ -11,7 +11,11 @@ public enum MainThreadLog {
     nonisolated private static let signposter = OSSignposter(subsystem: "com.tim.nook", category: "perf")
 
     public static var url: URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("ui-forensics.log")
+        if let path = launchValue("-NookPerfLog", in: ProcessInfo.processInfo.arguments)
+            ?? ProcessInfo.processInfo.environment["NOOK_PERF_LOG_PATH"] {
+            return URL(fileURLWithPath: path)
+        }
+        return FileManager.default.temporaryDirectory.appendingPathComponent("ui-forensics.log")
     }
 
     public static func note(_ phase: String, extra: String = "") {
