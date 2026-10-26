@@ -10,14 +10,18 @@ cd "$repo_root"
 export LC_ALL=C
 
 head="$(git rev-parse HEAD)"
-if [[ -z "$(git status --porcelain)" ]]; then
+# Separate assignments so set -e sees a git failure; --untracked-files=all
+# overrides a status.showUntrackedFiles=no config that would hide new sources.
+porcelain="$(git status --porcelain --untracked-files=all)"
+if [[ -z "$porcelain" ]]; then
   echo "$head"
   exit 0
 fi
 
+tracked_diff="$(git diff HEAD --binary)"
 fingerprint="$(
   {
-    git diff HEAD --binary
+    printf '%s\0' "$tracked_diff"
     git ls-files -o --exclude-standard -z | while IFS= read -r -d '' path; do
       printf 'untracked %s\0' "$path"
       if [[ -L "$path" ]]; then
