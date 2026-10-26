@@ -32,6 +32,9 @@ public final class RelativeTimeTicker {
     @ObservationIgnored private var timer: Timer?
 
     private init() {
+        #if DEBUG
+        guard !ProcessInfo.processInfo.arguments.contains("-NookFreezeRelativeTime") else { return }
+        #endif
         // Tolerance lets the system coalesce the wakeup; exact minute
         // boundaries don't matter for "n minutes ago" copy.
         let timer = Timer(timeInterval: 60, repeats: true) { _ in

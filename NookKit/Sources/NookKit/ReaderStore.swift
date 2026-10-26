@@ -17,6 +17,10 @@ public final class ReaderStore {
     private var feedsByID: [Feed.ID: Feed] = [:]
     var articles: [Article] = [] {
         didSet {
+            #if DEBUG && os(macOS)
+            let didSetStarted = ProcessInfo.processInfo.systemUptime
+            defer { MainThreadLog.add("store.didset.articles", ms: (ProcessInfo.processInfo.systemUptime - didSetStarted) * 1000) }
+            #endif
             // Classify hidden (filtered) articles first so counts and the list
             // both see the current set. Counts + unread badge then recompute on
             // every change (a single O(all) pass, cheap) so the Dock/app-icon
@@ -89,6 +93,14 @@ public final class ReaderStore {
             // repeatedly during a gesture; skip identical writes so a drag- or
             // select-all doesn't re-run the filter for a set that didn't change.
             guard feedSelection != oldValue else { return }
+            #if DEBUG && os(macOS)
+            if !feedSelection.isEmpty {
+                let source = feedSelection.count == 1
+                    ? "feed:\(feedSelection.first!)"
+                    : "feeds:\(feedSelection.count)"
+                MainThreadLog.selectionBegan(source: source)
+            }
+            #endif
             // Selecting a feed leaves the Categories scope (they're exclusive).
             if !feedSelection.isEmpty { categorySelection = nil }
             scheduleArticleFilter()
@@ -872,10 +884,20 @@ public final class ReaderStore {
 
         filterTask = Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
+                #if DEBUG && os(macOS)
+                return MainThreadLog.measure("bg.filter") {
+                    Self.computeVisibleArticles(
+                        snapshot, feedTitles: feedTitles, feedSelection: feedSelection,
+                        smartSelection: smartSelection, categorySelection: categorySelection, retained: retained,
+                        filteredIDs: filteredIDs, query: query, order: order
+                    )
+                }
+                #else
                 Self.computeVisibleArticles(
                     snapshot, feedTitles: feedTitles, feedSelection: feedSelection,
                     smartSelection: smartSelection, categorySelection: categorySelection, retained: retained, filteredIDs: filteredIDs, query: query, order: order
                 )
+                #endif
             }.value
             guard !Task.isCancelled, let self else { return }
             self.applyDisplayed(result, animated: animated)
@@ -911,6 +933,10 @@ public final class ReaderStore {
     }
 
     private func applyDisplayed(_ result: [Article], animated: Bool = true) {
+        #if DEBUG && os(macOS)
+        let applyStarted = ProcessInfo.processInfo.systemUptime
+        defer { MainThreadLog.add("store.applyDisplayed", ms: (ProcessInfo.processInfo.systemUptime - applyStarted) * 1000) }
+        #endif
         // Animate only when the visible rows actually change and still overlap
         // the current list — i.e. articles arriving (or filtering out) — so new
         // stories slide in instead of the list snapping/jumping. A full swap
@@ -959,10 +985,7 @@ public final class ReaderStore {
         let outerActivity = MainThreadLog.activity(
             willAnimate ? "list.publish.animated" : "list.publish")
         defer { MainThreadLog.activity(outerActivity) }
-        MainThreadLog.add(willAnimate ? "list.publish.animated" : "list.publish", ms: 0)
-        MainThreadLog.note(
-            "list.publish",
-            extra: "rows=\(oldIDs.count)->\(newIDs.count) animated=\(willAnimate)")
+        MainThreadLog.recordListPublish(from: oldIDs.count, to: newIDs.count, animated: willAnimate)
         #endif
         if willAnimate {
             withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
@@ -1068,6 +1091,9 @@ public final class ReaderStore {
     /// Selecting a smart source is single-select navigation and clears any
     /// feed selection, keeping the two scopes independent.
     public func selectSmartSource(_ source: SmartSource) {
+        #if DEBUG && os(macOS)
+        MainThreadLog.selectionBegan(source: source.rawValue)
+        #endif
         categorySelection = nil
         smartSelection = source
         feedSelection = []
@@ -1078,6 +1104,9 @@ public final class ReaderStore {
     /// Browses everything tagged with a category. Mutually exclusive with the
     /// smart-source and feed scopes.
     public func selectCategory(_ id: String) {
+        #if DEBUG && os(macOS)
+        MainThreadLog.selectionBegan(source: "category:\(id)")
+        #endif
         smartSelection = nil
         feedSelection = []
         categorySelection = id
@@ -2057,6 +2086,9 @@ public final class ReaderStore {
     /// Enqueues an article for background AI categorization (no-op unless AI is
     /// enabled and usable). Keyword categories are applied separately, up front.
     private func enqueueAICategorization(_ id: Article.ID) {
+        #if DEBUG
+        if debugLaunchFlagIsDisabled("-NookAICategorize") { return }
+        #endif
         guard isAICategorizationActive else { return }
         if !aiCategorizeQueue.contains(id) { aiCategorizeQueue.append(id) }
         guard !aiCategorizeRunning else { return }
@@ -2341,6 +2373,10 @@ public final class ReaderStore {
     /// common "nothing new on screen" case is a cheap scan. Seen state syncs to
     /// peers via the shard, suppressing the notification on the other device too.
     private func markVisibleArticlesSeen() {
+        #if DEBUG && os(macOS)
+        let markStarted = ProcessInfo.processInfo.systemUptime
+        defer { MainThreadLog.add("store.markSeen", ms: (ProcessInfo.processInfo.systemUptime - markStarted) * 1000) }
+        #endif
         guard isForegroundActive, storage != nil else { return }
         var wrote = false
         for article in displayedArticles where !article.isRead {
@@ -2373,6 +2409,9 @@ public final class ReaderStore {
     /// Selecting a folder selects all feeds inside it, so the article list
     /// shows the folder's combined articles.
     public func selectFolder(_ folder: String) {
+        #if DEBUG && os(macOS)
+        MainThreadLog.selectionBegan(source: "folder:\(folder)")
+        #endif
         // Leave the category scope even for an empty folder (feedSelection's didSet
         // only clears it when non-empty).
         categorySelection = nil
@@ -3757,7 +3796,7 @@ public final class ReaderStore {
         }
     }
 
-    func refresh(feedID: Feed.ID) {
+    public func refresh(feedID: Feed.ID) {
         guard !isPreparingLocalReset, feed(for: feedID) != nil else { return }
         feedSelection = [feedID]
 
@@ -3936,6 +3975,10 @@ public final class ReaderStore {
     /// currently displayed. One property republish; no O(n) refilter.
     @discardableResult
     private func updateDisplayedArticleInPlace(_ id: Article.ID, _ mutate: (inout Article) -> Void) -> Bool {
+        #if DEBUG && os(macOS)
+        let updateStarted = ProcessInfo.processInfo.systemUptime
+        defer { MainThreadLog.add("store.updateInPlace", ms: (ProcessInfo.processInfo.systemUptime - updateStarted) * 1000) }
+        #endif
         guard let index = displayedArticles.firstIndex(where: { $0.id == id }) else { return false }
         mutate(&displayedArticles[index])
         return true
@@ -4156,6 +4199,22 @@ public final class ReaderStore {
 
     private func restoreStorageIfPossible() async {
         do {
+            #if DEBUG
+            if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-NookPerfLibrary"),
+               ProcessInfo.processInfo.arguments.indices.contains(index + 1) {
+                let directoryURL = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[index + 1], isDirectory: true)
+                let storage = ReaderStorage(directoryURL: directoryURL)
+                self.storage = storage
+                syncFolderDisplayPath = directoryURL.path(percentEncoded: false)
+                try await bringSyncFolderOnline(storage: storage, directoryURL: directoryURL)
+                #if os(macOS)
+                MainThreadLog.note(
+                    "perf.library",
+                    extra: "articles=\(articles.count) unread=\(articles.filter { !$0.isRead }.count) starred=\(articles.filter(\.isStarred).count) feeds=\(feeds.count)")
+                #endif
+                return
+            }
+            #endif
             guard let directoryURL = try ReaderStorage.resolveBookmarkedDirectory() else {
                 // Returning local-library user (iOS): reconstruct storage from
                 // the CURRENT container path — never from a stored bookmark.
@@ -4723,6 +4782,10 @@ public final class ReaderStore {
     /// only ever holds network snapshots, never store state.
     private func merge(batch: [ParsedFeed], animated: Bool) {
         guard !batch.isEmpty else { return }
+        #if DEBUG && os(macOS)
+        let mergeStarted = ProcessInfo.processInfo.systemUptime
+        defer { MainThreadLog.add("store.merge", ms: (ProcessInfo.processInfo.systemUptime - mergeStarted) * 1000) }
+        #endif
 
         // Which feeds already had articles BEFORE this batch. A brand-new feed's
         // first batch shouldn't flash (nothing "arrived" for the user yet); the
@@ -4850,6 +4913,9 @@ public final class ReaderStore {
                 articles = merged
             }
         }
+        #if DEBUG && os(macOS)
+        if hasChangedArticles && !hasNewArticles { MainThreadLog.add("store.merge.changedNoNew", ms: 0) }
+        #endif
 
         // Persist the keyword categories just assigned to new articles (so they
         // sync), and queue those articles for background AI categorization (a
@@ -4942,6 +5008,9 @@ public final class ReaderStore {
             return
         }
         guard !pendingBatchMerges.isEmpty else { return }
+        #if DEBUG && os(macOS)
+        MainThreadLog.add("store.merge.flush", ms: 0)
+        #endif
         let bucket = pendingBatchMerges
         pendingBatchMerges = []
         batchMergeFlushTask?.cancel()
@@ -5126,6 +5195,9 @@ public final class ReaderStore {
         guard storage.faviconNeedsRefresh(forKey: key), !faviconAttemptedKeys.contains(key) else {
             return
         }
+        #if DEBUG
+        if debugLaunchFlagIsDisabled("-NookFaviconFetch") { return }
+        #endif
         faviconAttemptedKeys.insert(key)
         faviconQueue.append(feed)
         pumpFaviconQueue()
@@ -5253,6 +5325,9 @@ public final class ReaderStore {
     /// Issues the next monotonic HLC for a local write, always strictly greater
     /// than anything this device has issued or observed.
     private func nextHLC() -> HLC {
+        #if DEBUG && os(macOS)
+        MainThreadLog.add("store.hlc.tick", ms: 0)
+        #endif
         lastHLC = HLC.next(after: lastHLC, node: deviceID)
         ownShard.clock = lastHLC
         return lastHLC
@@ -5409,3 +5484,12 @@ public final class ReaderStore {
         shardSaveDrainTask = nil
     }
 }
+
+#if DEBUG
+private func debugLaunchFlagIsDisabled(_ key: String) -> Bool {
+    let arguments = ProcessInfo.processInfo.arguments
+    guard let index = arguments.firstIndex(of: key),
+          arguments.indices.contains(index + 1) else { return false }
+    return ["no", "false", "0"].contains(arguments[index + 1].lowercased())
+}
+#endif

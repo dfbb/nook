@@ -1,0 +1,10 @@
+{
+  "repetitions": 5,
+  "steps": [
+    {"id":"D1","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectIndex","index":499}},
+    {"id":"D2","setup":[{"type":"selectSmart","target":"all"},{"type":"selectIndex","index":0}],"action":{"type":"toggleRead","count":20,"rate":2}},
+    {"id":"D3","setup":[{"type":"selectSmart","target":"all"},{"type":"selectIndex","index":0}],"action":{"type":"toggleStarRepeat","count":20,"rate":2}},
+    {"id":"D4","setup":[{"type":"selectSmart","target":"unread"},{"type":"selectIndex","index":0}],"action":{"type":"setRead","value":"true"}},
+    {"id":"D5","setup":[{"type":"selectSmart","target":"all"},{"type":"selectIndex","index":0}],"action":{"type":"nextRepeat","count":20}}
+  ]
+}

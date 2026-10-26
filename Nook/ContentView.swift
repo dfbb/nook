@@ -81,6 +81,9 @@ struct ContentView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = MainThreadLog.add("root.body", ms: 0)
+        #endif
         NavigationSplitView(columnVisibility: $columnVisibility) {
             FeedSidebar(
                 store: store,
@@ -251,6 +254,9 @@ struct ContentView: View {
             // first badge update (driven by the store) already respects it.
             store.showsUnreadBadge = showUnreadBadge
             await store.bootstrap()
+            #if DEBUG
+            await PerfDriver.shared.runIfRequested(store: store)
+            #endif
             // Let the window paint the loaded library first, then kick off the
             // launch-time bursts (WebKit warm-up and the network refresh) so
             // their CPU/IO spike doesn't stall the first frames.
@@ -548,6 +554,9 @@ private struct FeedSidebar: View {
     @State private var actionFeedback = 0
 
     var body: some View {
+        #if DEBUG
+        let _ = MainThreadLog.add("sidebar.body", ms: 0)
+        #endif
         List(selection: $store.feedSelection) {
             Section("Library") {
                 ForEach(SmartSource.library) { source in
@@ -1436,6 +1445,9 @@ private struct SourceRow: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = MainThreadLog.add("sidebar.row", ms: 0)
+        #endif
         Label {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -1491,6 +1503,42 @@ private struct SourceRow: View {
     }
 }
 
+#if DEBUG
+@MainActor
+enum PerfListScrollTarget {
+    static weak var scrollView: NSScrollView?
+}
+
+private struct PerfDisplayLinkProbe: NSViewRepresentable {
+    func makeNSView(context: Context) -> ProbeView { ProbeView() }
+    func updateNSView(_ nsView: ProbeView, context: Context) {}
+
+    @MainActor
+    final class ProbeView: NSView {
+        private var link: CADisplayLink?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            link?.invalidate()
+            link = nil
+            guard window != nil else { return }
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                PerfListScrollTarget.scrollView = self?.enclosingScrollView
+            }
+            let link = displayLink(target: self, selector: #selector(frame(_:)))
+            link.add(to: .main, forMode: .common)
+            self.link = link
+        }
+
+        @objc private func frame(_ link: CADisplayLink) {
+            guard MainThreadLog.isScenarioActive else { return }
+            MainThreadLog.recordFrame(timestamp: link.timestamp, targetTimestamp: link.targetTimestamp)
+        }
+    }
+}
+#endif
+
 private struct ArticleListView: View {
     @Bindable var store: ReaderStore
     @AppStorage(ReaderStore.translateListTitlesKey) private var translateListTitles = false
@@ -1534,6 +1582,11 @@ private struct ArticleListView: View {
                 }
             } else {
                 List(selection: $store.selectedArticleID) {
+                    #if DEBUG
+                    PerfDisplayLinkProbe()
+                        .frame(width: 0, height: 0)
+                        .accessibilityHidden(true)
+                    #endif
                     ForEach(store.visibleArticles) { article in
                         #if DEBUG
                         // The closure itself, which runs per row per pass whatever
@@ -2437,6 +2490,9 @@ private struct ReaderDetailView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = MainThreadLog.add("reader.body", ms: 0)
+        #endif
         baseContent
     }
 

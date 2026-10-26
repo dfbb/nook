@@ -83,6 +83,19 @@ actor ListTitleTranslationWorker {
         _ request: Request,
         _ onPartial: @escaping @Sendable (String) async -> Void
     ) async throws -> String? {
+        #if DEBUG
+        if let delay = TranslationSettings.fakeTranslatorDelay {
+            let result = "[\(request.languageName)] \(request.source)"
+            var partial = ""
+            for character in result {
+                try await Task.sleep(for: .milliseconds(delay))
+                try Task.checkCancellation()
+                partial.append(character)
+                await onPartial(partial)
+            }
+            return result
+        }
+        #endif
         let keepTerms = NaturalTranslator.heuristicKeepTokens(request.source)
         do {
             let result = try await NaturalTranslator.streamTranslateBlockOffMain(

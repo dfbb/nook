@@ -81,6 +81,9 @@ public final class ListTitleTranslator {
         if let existing = boxes[id] { return existing }
         let created = StateBox()
         boxes[id] = created
+        #if DEBUG && os(macOS)
+        MainThreadLog.add("list.title.box", ms: 0)
+        #endif
         return created
     }
 
@@ -155,7 +158,11 @@ public final class ListTitleTranslator {
         let available: Bool
         switch newProvider {
         case .appleIntelligence:
+            #if DEBUG
+            available = TranslationSettings.fakeTranslatorDelay != nil || NaturalTranslator.isAvailable
+            #else
             available = NaturalTranslator.isAvailable
+            #endif
         case .gemini:
             available = UserDefaults.standard.bool(forKey: TranslationSettings.geminiKeyConfiguredKey)
         }

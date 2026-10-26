@@ -1,0 +1,20 @@
+{
+  "repetitions": 5,
+  "coldFirst": true,
+  "steps": [
+    {"id":"A1","setup":[{"type":"selectFeed","target":"feed-small"}],"action":{"type":"selectSmart","target":"all"}},
+    {"id":"A2","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectSmart","target":"unread"}},
+    {"id":"A3","setup":[{"type":"selectSmart","target":"unread"}],"action":{"type":"selectSmart","target":"all"}},
+    {"id":"A4","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectSmart","target":"starred"}},
+    {"id":"A5","setup":[{"type":"selectSmart","target":"starred"}],"action":{"type":"selectSmart","target":"all"}},
+    {"id":"A6","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectFeed","target":"feed-big"}},
+    {"id":"A7","setup":[{"type":"selectFeed","target":"feed-big"}],"action":{"type":"selectFolder","target":"1"}},
+    {"id":"A8","setup":[{"type":"selectFolder","target":"1"}],"action":{"type":"selectCategory","target":"1"}},
+    {"id":"A9","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectFeed","target":"first:50"}},
+    {"id":"A10","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectFeed","target":"all"}},
+    {"id":"A11","setup":[{"type":"selectFeed","target":"feed-small"}],"action":{"type":"latestWins"}},
+    {"id":"A12","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"searchToggle","value":"performance"}},
+    {"id":"A13","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectSmart","target":"today"}},
+    {"id":"A14","setup":[{"type":"selectSmart","target":"all"},{"type":"selectIndex","index":499}],"action":{"type":"selectFeed","target":"feed-big"}}
+  ]
+}

@@ -124,6 +124,9 @@ final class BackgroundRefreshController: NSObject, NSApplicationDelegate, UNUser
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        MainThreadLog.startWatchdog()
+        #endif
         UNUserNotificationCenter.current().delegate = self
         // ⌘Q becomes a press-and-hold while a composer holds unsaved writing.
         QuitHoldController.shared.install()

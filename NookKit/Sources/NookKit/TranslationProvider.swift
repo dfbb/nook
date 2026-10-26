@@ -14,6 +14,14 @@ public enum TranslationProvider: String, Sendable, CaseIterable {
 /// Per-surface provider selection, stored in local `UserDefaults` (never synced).
 /// The Gemini API key lives in the Keychain instead (see `GeminiCredential`).
 public enum TranslationSettings {
+    #if DEBUG
+    public static var fakeTranslatorDelay: Int? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-NookFakeTranslator"),
+              arguments.indices.contains(index + 1) else { return nil }
+        return Int(arguments[index + 1]).map { max(0, $0) }
+    }
+    #endif
     /// Provider for the full-article reader translation.
     public static let readerProviderKey = "readerTranslationProvider"
     /// Provider for the article-list title auto-translation.
