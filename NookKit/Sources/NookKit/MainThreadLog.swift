@@ -45,54 +45,101 @@ public enum MainThreadLog {
     public static func scenarioBegin(id: String, rep: Int, cold: Bool) {
         if scenario != nil { scenarioEnd() }
         previousFrameTimestamp = nil
+        // A selection from setup (or an earlier scenario) that never published must
+        // not end inside this one and report a TTFR it did not cause.
+        selectStartedAt = nil
+        pendingSettle = false
+        readerSelectStartedAt = nil
+        pendingReaderSettle = false
         scenario = Scenario(
-            id: id, rep: rep, startedAt: ProcessInfo.processInfo.systemUptime,
-            probe: MainThreadProbe.shared.snapshot(), frames: [], dropped: 0,
-            hitchMs: 0, publishRows: 0, didRecordPublish: false, ttfr: 0)
+            id: id, rep: rep, cold: cold, startedAt: ProcessInfo.processInfo.systemUptime,
+            probe: MainThreadProbe.shared.beginScenario())
         scenarioSignpostState = signposter.beginInterval("scenario", "id=\(id, privacy: .public)")
         note("scenario.begin", extra: "id=\(token(id)) rep=\(rep) cold=\(cold ? 1 : 0)")
     }
 
-    public static func scenarioEnd() {
+    /// Ends the open scenario. `activeEnd` is when the workload itself stopped
+    /// (action done, refresh finished); a later publish, settle or stall end
+    /// extends it. The driver's quiesce tail after it is wall time (`dur`) but not
+    /// part of the rates (`activeDur`).
+    public static func scenarioEnd(activeEnd: Double? = nil) {
         guard let current = scenario else { return }
         scenario = nil
         if let state = scenarioSignpostState { signposter.endInterval("scenario", state) }
         scenarioSignpostState = nil
 
-        let durationMs = (ProcessInfo.processInfo.systemUptime - current.startedAt) * 1000
-        let diff = MainThreadProbe.shared.diff(since: current.probe)
+        let now = ProcessInfo.processInfo.systemUptime
+        var activeUntil = activeEnd ?? now
+        if lastActivityAt > current.startedAt { activeUntil = max(activeUntil, lastActivityAt) }
+        activeUntil = min(max(activeUntil, current.startedAt), now)
+        let durationMs = (now - current.startedAt) * 1000
+        let activeMs = (activeUntil - current.startedAt) * 1000
+        let diff = MainThreadProbe.shared.endScenario(since: current.probe)
         let stalls = diff.stalls.map { $0 * 1000 }
-        let frames = current.frames.sorted()
-        let p99Index = frames.isEmpty ? 0 : min(frames.count - 1, Int(Double(frames.count) * 0.99))
-        let calls: (String) -> Int = { diff.samples[$0]?.count ?? 0 }
-        let total: (String) -> Double = { diff.samples[$0]?.reduce(0, +) ?? 0 }
-        let p95: (String) -> Double = { percentile(diff.samples[$0] ?? [], 0.95) }
-        let maximum: (String) -> Double = { diff.samples[$0]?.max() ?? 0 }
-        let fields = [
-            "scenario.stats", "id=\(token(current.id))", "rep=\(current.rep)", "dur=\(number(durationMs))",
+
+        // Frame statistics cover the active window only (plus the frame that was
+        // in flight when it closed), so an idle tail cannot dilute them.
+        let active = current.frames.filter { $0.at <= activeUntil + $0.expected / 1000 }
+        let deltas = active.map(\.ms).sorted()
+        var dropped = 0
+        var hitchMs = 0.0
+        for frame in active where frame.ms > frame.expected * 1.5 {
+            dropped += max(1, Int((frame.ms / frame.expected).rounded(.down)) - 1)
+            hitchMs += max(0, frame.ms - frame.expected)
+        }
+        let p99Index = deltas.isEmpty ? 0 : min(deltas.count - 1, Int(Double(deltas.count) * 0.99))
+        let droppedPct = deltas.count + dropped > 0 ? Double(dropped) / Double(deltas.count + dropped) * 100 : 0
+
+        let calls: (String) -> Int = { diff.totals[$0]?.calls ?? 0 }
+        let total: (String) -> Double = { diff.totals[$0]?.ms ?? 0 }
+        let p95: (String) -> Double = { percentile(diff.distributions[$0] ?? [], 0.95) }
+        let maximum: (String) -> Double = { diff.distributions[$0]?.max() ?? 0 }
+        var fields = [
+            "scenario.stats", "id=\(token(current.id))", "rep=\(current.rep)", "cold=\(current.cold ? 1 : 0)",
+            "dur=\(number(durationMs))", "activeDur=\(number(activeMs))",
             "stalls50=\(stalls.filter { $0 >= 50 }.count)", "stalls100=\(stalls.filter { $0 >= 100 }.count)",
             "stalls250=\(stalls.filter { $0 >= 250 }.count)", "stalls500=\(stalls.filter { $0 >= 500 }.count)",
             "stalls1000=\(stalls.filter { $0 >= 1000 }.count)", "worstStall=\(number(stalls.max() ?? 0))",
             "stalledMs=\(number(stalls.reduce(0, +)))", "ttfr=\(number(current.ttfr))",
-            "publish=\(calls("list.publish"))", "publishRows=\(current.publishRows)", "body=\(calls("list.body"))",
+            "readerTTFR=\(number(current.readerTTFR))",
+            // `list.publish` and `list.publish.animated` stay exclusive labels; the
+            // stat is their sum, and the animated share is reported beside it.
+            "publish=\(calls("list.publish") + calls("list.publish.animated"))",
+            "publishAnimated=\(calls("list.publish.animated"))",
+            "publishRows=\(current.publishRows)", "body=\(calls("list.body"))",
             "rowcontent=\(calls("list.rowcontent"))", "row=\(calls("list.row"))", "rowHeight=\(calls("list.row.height"))",
+            "rowHeightFlush=\(calls("list.row.height.flush"))",
             "rowMenu=\(calls("list.row.menu") + calls("list.row.swipe"))", "relTime=\(calls("relativetime.body"))",
             "rootBody=\(calls("root.body"))", "sidebarBody=\(calls("sidebar.body"))", "sidebarRow=\(calls("sidebar.row"))",
-            "readerBody=\(calls("reader.body"))", "frames=\(current.frames.count)", "dropped=\(current.dropped)",
-            "hitchMs=\(number(current.hitchMs))", "hitchRatio=\(number(durationMs > 0 ? current.hitchMs / (durationMs / 1000) : 0))",
-            "p99Frame=\(number(frames.isEmpty ? 0 : frames[p99Index]))", "worstFrame=\(number(frames.last ?? 0))",
-            "applyMs=\(number(total("store.applyDisplayed")))", "mergeMs=\(number(p95("store.merge")))",
+            "readerBody=\(calls("reader.body"))", "titleBox=\(calls("list.title.box"))",
+            "titleBoxRelease=\(calls("list.title.box.release"))",
+            "frames=\(deltas.count)", "dropped=\(dropped)", "droppedPct=\(number(droppedPct))",
+            "hitchMs=\(number(hitchMs))", "hitchRatio=\(number(activeMs > 0 ? hitchMs / (activeMs / 1000) : 0))",
+            "p99Frame=\(number(deltas.isEmpty ? 0 : deltas[p99Index]))", "worstFrame=\(number(deltas.last ?? 0))",
+            "applyMs=\(number(total("store.applyDisplayed")))", "mergeMs=\(number(total("store.merge")))",
+            "mergeP95=\(number(p95("store.merge")))", "mergeCalls=\(calls("store.merge"))",
             "mergeFlush=\(calls("store.merge.flush"))", "mergeChangedNoNew=\(calls("store.merge.changedNoNew"))",
             "mergeFallback=\(calls("store.merge.fallback"))", "didsetMs=\(number(total("store.didset.articles")))",
             "markSeenMs=\(number(total("store.markSeen")))", "hlcTick=\(calls("store.hlc.tick"))",
-            "updateInPlaceMs=\(number(total("store.updateInPlace")))", "grow=\(calls("list.window.grow"))",
+            "updateInPlaceMs=\(number(total("store.updateInPlace")))",
+            "updateInPlaceMaxMs=\(number(maximum("store.updateInPlace")))", "grow=\(calls("list.window.grow"))",
             "growMaxMs=\(number(maximum("list.window.grow")))",
         ]
+        fields += current.extras.map { "\($0.key)=\($0.value)" }
         raw(fields.joined(separator: " "))
         flush()
     }
 
     public static var isScenarioActive: Bool { scenario != nil }
+
+    /// Attaches a scenario-specific value (`toggles`, `missedSelection`, …) to the
+    /// open scenario's stats line. Keys appear only on scenarios that set them.
+    public static func scenarioValue(_ key: String, _ value: Int) {
+        guard var current = scenario else { return }
+        current.extras.removeAll { $0.key == key }
+        current.extras.append((key, String(value)))
+        scenario = current
+    }
 
     public static func recordFrame(timestamp: Double, targetTimestamp: Double) {
         guard var current = scenario else { return }
@@ -102,24 +149,22 @@ public enum MainThreadLog {
             return
         }
         previousFrameTimestamp = timestamp
-        let delta = max(0, (timestamp - previous) * 1000)
-        let expected = max(0.1, (targetTimestamp - timestamp) * 1000)
-        current.frames.append(delta)
-        if delta > expected * 1.5 {
-            current.dropped += max(1, Int((delta / expected).rounded(.down)) - 1)
-            current.hitchMs += max(0, delta - expected)
-        }
+        current.frames.append((
+            at: ProcessInfo.processInfo.systemUptime,
+            ms: max(0, (timestamp - previous) * 1000),
+            expected: max(0.1, (targetTimestamp - timestamp) * 1000)))
     }
 
     public static func selectionBegan(source: String) {
         selectStartedAt = ProcessInfo.processInfo.systemUptime
+        pendingSettle = false
         note("select.begin", extra: "source=\(token(source))")
     }
 
     public static func recordListPublish(from oldCount: Int, to newCount: Int, animated: Bool) {
         lastPublishAt = ProcessInfo.processInfo.systemUptime
-        add("list.publish", ms: 0)
-        if animated { add("list.publish.animated", ms: 0) }
+        lastMarkedActivityAt = lastPublishAt
+        add(animated ? "list.publish.animated" : "list.publish", ms: 0)
         note("list.publish", extra: "rows=\(oldCount)->\(newCount) animated=\(animated)")
         if var current = scenario {
             if !current.didRecordPublish {
@@ -131,14 +176,50 @@ public enum MainThreadLog {
         if selectStartedAt != nil { pendingSettle = true }
     }
 
+    /// Starts a reader TTFR: an article selection whose reader has yet to render.
+    public static func articleSelectionBegan() {
+        readerSelectStartedAt = ProcessInfo.processInfo.systemUptime
+        pendingReaderSettle = false
+    }
+
+    /// The reader's `body`. Counted as `reader.body`, and the first one after an
+    /// article selection ends that selection's reader TTFR on the next heartbeat,
+    /// the same approximation `list.settled` uses for the list.
+    public static func readerBody() {
+        add("reader.body", ms: 0)
+        if readerSelectStartedAt != nil { pendingReaderSettle = true }
+    }
+
+    /// Counts `label` at most once per main run-loop turn — how many turns did
+    /// any of this work, rather than how many times it was asked for.
+    public static func addOncePerTurn(_ label: String) {
+        guard countedThisTurn.insert(label).inserted else { return }
+        add(label, ms: 0)
+        RunLoop.main.perform {
+            MainActor.assumeIsolated { _ = MainThreadLog.countedThisTurn.remove(label) }
+        }
+    }
+
+    private static var countedThisTurn: Set<String> = []
+
     private static func heartbeat(_ now: Double) {
         MainThreadProbe.shared.beat(now)
-        guard pendingSettle, let selectedAt = selectStartedAt else { return }
-        pendingSettle = false
-        selectStartedAt = nil
-        let ms = (now - selectedAt) * 1000
-        if var current = scenario { current.ttfr = ms; scenario = current }
-        note("list.settled", extra: "sinceSelect=\(number(ms))ms")
+        if pendingSettle, let selectedAt = selectStartedAt {
+            pendingSettle = false
+            selectStartedAt = nil
+            let ms = (now - selectedAt) * 1000
+            lastMarkedActivityAt = now
+            if var current = scenario { current.ttfr = ms; scenario = current }
+            note("list.settled", extra: "sinceSelect=\(number(ms))ms")
+        }
+        if pendingReaderSettle, let selectedAt = readerSelectStartedAt {
+            pendingReaderSettle = false
+            readerSelectStartedAt = nil
+            let ms = (now - selectedAt) * 1000
+            lastMarkedActivityAt = now
+            if var current = scenario { current.readerTTFR = max(current.readerTTFR, ms); scenario = current }
+            note("reader.settled", extra: "sinceSelect=\(number(ms))ms")
+        }
     }
 
     public static func noteFallbackTags(in html: String) {
@@ -192,6 +273,7 @@ public enum MainThreadLog {
         let configuredMs = launchValue("-NookStallMs", in: ProcessInfo.processInfo.arguments).flatMap(Double.init)
         let heartbeatInterval = configuredMs == nil ? 0.05 : 0.008
         let threshold = (configuredMs ?? 250) / 1000
+        MainThreadProbe.shared.configure(interval: heartbeatInterval, threshold: threshold)
         let timer = Timer(timeInterval: heartbeatInterval, repeats: true) { _ in
             MainActor.assumeIsolated { MainThreadLog.heartbeat(ProcessInfo.processInfo.systemUptime) }
         }
@@ -216,7 +298,7 @@ public enum MainThreadLog {
         let watchdog = Thread {
             while true {
                 let now = ProcessInfo.processInfo.systemUptime
-                if let stall = MainThreadProbe.shared.sample(now: now, threshold: threshold) {
+                if let stall = MainThreadProbe.shared.sample(now: now) {
                     Task { @MainActor in
                         MainThreadLog.note("STALL", extra: "for \(stall.seconds.rounded(toPlaces: 3))s during \(stall.during)")
                     }
@@ -240,14 +322,17 @@ public enum MainThreadLog {
     private struct Scenario {
         let id: String
         let rep: Int
+        let cold: Bool
         let startedAt: Double
         let probe: MainThreadProbe.Snapshot
-        var frames: [Double]
-        var dropped: Int
-        var hitchMs: Double
-        var publishRows: Int
-        var didRecordPublish: Bool
-        var ttfr: Double
+        var frames: [(at: Double, ms: Double, expected: Double)] = []
+        var publishRows = 0
+        var didRecordPublish = false
+        /// -1 until a select → `list.settled` completes inside the scenario.
+        var ttfr: Double = -1
+        /// -1 until an article selection → first reader body settles; the worst one otherwise.
+        var readerTTFR: Double = -1
+        var extras: [(key: String, value: String)] = []
     }
 
     private static var didBeginRun = false
@@ -256,7 +341,13 @@ public enum MainThreadLog {
     private static var previousFrameTimestamp: Double?
     private static var selectStartedAt: Double?
     private static var pendingSettle = false
+    private static var readerSelectStartedAt: Double?
+    private static var pendingReaderSettle = false
     public private(set) static var lastPublishAt: Double = 0
+    private static var lastMarkedActivityAt: Double = 0
+    /// The latest publish, list/reader settle, or end of a stall — the last sign
+    /// that a scenario's work was still running.
+    public static var lastActivityAt: Double { max(lastMarkedActivityAt, MainThreadProbe.shared.lastStallAt()) }
     private static var heartbeatTimer: Timer?
     private static var flushTimer: Timer?
     private static var phaseObserver: CFRunLoopObserver?
@@ -296,60 +387,119 @@ public enum MainThreadLog {
 }
 
 private final class MainThreadProbe: @unchecked Sendable {
-    struct Snapshot: Sendable { let sampleCounts: [String: Int]; let stallCount: Int }
+    struct Total: Sendable { var calls = 0; var ms = 0.0 }
+    struct Snapshot: Sendable { let totals: [String: Total]; let stallCount: Int }
     static let shared = MainThreadProbe()
+    /// Labels whose per-call distribution a scenario reports (p95/max). Everything
+    /// else keeps only running totals, so per-row counters cost O(1) memory however
+    /// long a Debug session runs.
+    private static let distributionLabels: Set<String> = ["store.merge", "store.updateInPlace", "list.window.grow"]
+
     private let lock = NSLock()
     private var heartbeat = ProcessInfo.processInfo.systemUptime
+    private var interval = 0.05
+    private var threshold = 0.25
+    /// The last heartbeat gap longer than the threshold: the previous beat and the
+    /// first fresh one after it, so a stall ends where the main thread came back
+    /// rather than where the watchdog next happened to look.
+    private var lastGap: (previous: Double, fresh: Double)?
     private var activity = "-"
     private var phase = "-"
-    private var samples: [String: [Double]] = [:]
+    private var totals: [String: Total] = [:]
+    private var distributions: [String: [Double]] = [:]
+    private var recordsDistributions = false
     private var stalls: [(started: Double, seconds: Double, during: String)] = []
-    private var inStall: (started: Double, activity: String, phase: String, work: [String: Int])?
+    /// Watchdog thread only.
+    private var inStall: (started: Double, activity: String, phase: String, work: [String: Total])?
     private var lastStallEndedAt = -Double.infinity
 
-    func beat(_ now: Double) { lock.withLock { heartbeat = now } }
+    func configure(interval: Double, threshold: Double) {
+        lock.withLock { self.interval = interval; self.threshold = threshold }
+    }
+    func beat(_ now: Double) {
+        lock.withLock {
+            if now - heartbeat > threshold { lastGap = (heartbeat, now) }
+            heartbeat = now
+        }
+    }
     @discardableResult func setActivity(_ label: String) -> String {
         lock.withLock { let previous = activity; activity = label; return previous }
     }
     func setPhase(_ value: String) { lock.withLock { phase = value } }
-    func add(_ label: String, ms: Double) { lock.withLock { samples[label, default: []].append(ms) } }
-    func snapshot() -> Snapshot { lock.withLock { Snapshot(sampleCounts: samples.mapValues(\.count), stallCount: stalls.count) } }
-
-    func diff(since snapshot: Snapshot) -> (samples: [String: [Double]], stalls: [Double]) {
+    func add(_ label: String, ms: Double) {
         lock.withLock {
-            var changed: [String: [Double]] = [:]
-            for (label, values) in samples { changed[label] = Array(values.dropFirst(snapshot.sampleCounts[label] ?? 0)) }
-            return (changed, Array(stalls.dropFirst(snapshot.stallCount)).map(\.seconds))
+            totals[label, default: Total()].calls += 1
+            totals[label, default: Total()].ms += ms
+            if recordsDistributions, Self.distributionLabels.contains(label) {
+                distributions[label, default: []].append(ms)
+            }
         }
     }
 
-    func sample(now: Double, threshold: Double) -> (seconds: Double, during: String)? {
-        let state = lock.withLock { (heartbeat, activity, phase, samples.mapValues(\.count)) }
-        let late = now - state.0
-        if late > threshold {
-            if inStall == nil { inStall = (now - late, state.1, state.2, state.3) }
-            return nil
+    func beginScenario() -> Snapshot {
+        lock.withLock {
+            distributions = [:]
+            recordsDistributions = true
+            return Snapshot(totals: totals, stallCount: stalls.count)
         }
+    }
+
+    func endScenario(since snapshot: Snapshot) -> (totals: [String: Total], distributions: [String: [Double]], stalls: [Double]) {
+        lock.withLock {
+            recordsDistributions = false
+            var changed: [String: Total] = [:]
+            for (label, entry) in totals {
+                let before = snapshot.totals[label] ?? Total()
+                guard entry.calls > before.calls else { continue }
+                changed[label] = Total(calls: entry.calls - before.calls, ms: entry.ms - before.ms)
+            }
+            let result = (changed, distributions, Array(stalls.dropFirst(snapshot.stallCount)).map(\.seconds))
+            distributions = [:]
+            return result
+        }
+    }
+
+    func sample(now: Double) -> (seconds: Double, during: String)? {
+        lock.lock()
+        let late = now - heartbeat
+        let threshold = threshold
+        let interval = interval
+        if late > threshold, inStall == nil {
+            inStall = (heartbeat, activity, phase, totals)
+        }
+        let gap = lastGap
+        lock.unlock()
+        if late > threshold { return nil }
         guard let stall = inStall else { return nil }
         inStall = nil
-        let seconds = now - stall.started
-        let after = lock.withLock { samples }
-        let ran = after.compactMap { label, values -> String? in
-            let count = values.count - (stall.work[label] ?? 0)
-            guard count > 0 else { return nil }
-            let ms = values.suffix(count).reduce(0, +)
-            return ms >= 1 ? "\(label)x\(count) \(ms.rounded(toPlaces: 0))ms" : "\(label)x\(count)"
-        }.prefix(4).joined(separator: ", ")
+        // The main thread was certainly blocked from the beat it missed
+        // (previous + interval) until the fresh beat — a lower bound, never an
+        // overstatement by the watchdog's own sampling period.
+        let fresh = gap.flatMap { $0.previous == stall.started ? $0.fresh : nil } ?? now
+        let seconds = max(0, fresh - stall.started - interval)
+        let after = lock.withLock { totals }
+        let ran = after.compactMap { label, entry -> (String, Int, Double)? in
+            let before = stall.work[label] ?? Total()
+            let calls = entry.calls - before.calls
+            guard calls > 0 else { return nil }
+            return (label, calls, entry.ms - before.ms)
+        }
+        .sorted { $0.2 > $1.2 }
+        .prefix(4)
+        .map { $0.2 >= 1 ? "\($0.0)x\($0.1) \($0.2.rounded(toPlaces: 0))ms" : "\($0.0)x\($0.1)" }
+        .joined(separator: ", ")
         let during = (stall.activity == "-" ? "runloop:\(stall.phase)" : stall.activity)
             + (ran.isEmpty ? "  ran nothing counted" : "  ran \(ran)")
-        lock.withLock { stalls.append((stall.started, seconds, during)) }
-        lock.withLock { lastStallEndedAt = now }
+        lock.withLock {
+            stalls.append((stall.started + interval, seconds, during))
+            lastStallEndedAt = fresh
+        }
         return (seconds, during)
     }
 
     func totalsSnapshot() -> [(label: String, calls: Int, ms: Double)] {
         lock.withLock {
-            samples.map { (label: $0.key, calls: $0.value.count, ms: $0.value.reduce(0, +)) }.sorted { $0.ms > $1.ms }
+            totals.map { (label: $0.key, calls: $0.value.calls, ms: $0.value.ms) }.sorted { $0.ms > $1.ms }
         }
     }
     func stallSummary() -> (count: Int, total: Double, worst: Double) {

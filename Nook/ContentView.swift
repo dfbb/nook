@@ -1504,36 +1504,106 @@ private struct SourceRow: View {
 }
 
 #if DEBUG
+/// The article list's scroll view and frame clock, for `PerfDriver`. Only exists
+/// while a `-NookPerfScript` run is in progress; otherwise the probe is inert.
 @MainActor
 enum PerfListScrollTarget {
-    static weak var scrollView: NSScrollView?
+    static let isEnabled = ProcessInfo.processInfo.arguments.contains("-NookPerfScript")
+    fileprivate static weak var probe: PerfDisplayLinkProbe.ProbeView?
+    private static var frameWaiters: [CheckedContinuation<Void, Never>] = []
+    private static var frameGeneration = 0
+
+    /// The `NSScrollView` hosting the article `List`, re-resolved if the list was
+    /// rebuilt (an empty-state branch swaps it out).
+    static var scrollView: NSScrollView? { probe?.resolveScrollView() }
+    static var tableView: NSTableView? { scrollView?.documentView as? NSTableView }
+
+    /// Runs the display link only inside a scenario, so it is not main-thread work
+    /// while the driver waits for the app to settle.
+    static func setRecording(_ recording: Bool) { probe?.link?.isPaused = !recording }
+
+    /// Resumes on the next display-link callback, so the driver does exactly one
+    /// unit of work per vsync. Falls back after 250ms so a paused or detached link
+    /// cannot hang a run; a fallback is logged and makes the run suspect.
+    static func nextFrame() async {
+        let generation = frameGeneration
+        await withCheckedContinuation { continuation in
+            frameWaiters.append(continuation)
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(250))
+                guard frameGeneration == generation else { return }
+                MainThreadLog.note("perf.frame.timeout")
+                resumeFrameWaiters()
+            }
+        }
+    }
+
+    fileprivate static func resumeFrameWaiters() {
+        frameGeneration &+= 1
+        let waiters = frameWaiters
+        frameWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }
 
+/// Attached as the article `List`'s background: a sibling of the table, so — unlike
+/// a row — it is never removed or reused as rows scroll out.
 private struct PerfDisplayLinkProbe: NSViewRepresentable {
     func makeNSView(context: Context) -> ProbeView { ProbeView() }
     func updateNSView(_ nsView: ProbeView, context: Context) {}
 
     @MainActor
     final class ProbeView: NSView {
-        private var link: CADisplayLink?
+        fileprivate var link: CADisplayLink?
+        private weak var cachedScrollView: NSScrollView?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             link?.invalidate()
             link = nil
-            guard window != nil else { return }
-            Task { @MainActor [weak self] in
-                await Task.yield()
-                PerfListScrollTarget.scrollView = self?.enclosingScrollView
-            }
+            cachedScrollView = nil
+            guard window != nil, PerfListScrollTarget.isEnabled else { return }
+            PerfListScrollTarget.probe = self
             let link = displayLink(target: self, selector: #selector(frame(_:)))
+            link.isPaused = !MainThreadLog.isScenarioActive
             link.add(to: .main, forMode: .common)
             self.link = link
         }
 
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        /// The table scroll view that overlaps this background, found by walking up
+        /// from the probe and searching each ancestor's subtree, nearest first, so
+        /// the sidebar's `List` is never picked.
+        func resolveScrollView() -> NSScrollView? {
+            if let cached = cachedScrollView, cached.window === window { return cached }
+            guard window != nil else { return nil }
+            let center = convert(NSPoint(x: bounds.midX, y: bounds.midY), to: nil)
+            var ancestor = superview
+            while let current = ancestor {
+                if let found = Self.tableScrollView(in: current, containing: center) {
+                    cachedScrollView = found
+                    return found
+                }
+                ancestor = current.superview
+            }
+            return nil
+        }
+
+        private static func tableScrollView(in view: NSView, containing point: NSPoint) -> NSScrollView? {
+            if let scrollView = view as? NSScrollView, scrollView.documentView is NSTableView,
+               scrollView.convert(scrollView.bounds, to: nil).contains(point) {
+                return scrollView
+            }
+            for subview in view.subviews {
+                if let found = tableScrollView(in: subview, containing: point) { return found }
+            }
+            return nil
+        }
+
         @objc private func frame(_ link: CADisplayLink) {
-            guard MainThreadLog.isScenarioActive else { return }
             MainThreadLog.recordFrame(timestamp: link.timestamp, targetTimestamp: link.targetTimestamp)
+            PerfListScrollTarget.resumeFrameWaiters()
         }
     }
 }
@@ -1582,11 +1652,6 @@ private struct ArticleListView: View {
                 }
             } else {
                 List(selection: $store.selectedArticleID) {
-                    #if DEBUG
-                    PerfDisplayLinkProbe()
-                        .frame(width: 0, height: 0)
-                        .accessibilityHidden(true)
-                    #endif
                     ForEach(store.visibleArticles) { article in
                         #if DEBUG
                         // The closure itself, which runs per row per pass whatever
@@ -1614,6 +1679,9 @@ private struct ArticleListView: View {
                     }
                 }
                 .listStyle(.inset)
+                #if DEBUG
+                .background { PerfDisplayLinkProbe().accessibilityHidden(true) }
+                #endif
                 .onKeyPress(.return) {
                     // Enter on the selected row opens the web view, mirroring a
                     // click on the reader's title.
@@ -2491,7 +2559,7 @@ private struct ReaderDetailView: View {
 
     var body: some View {
         #if DEBUG
-        let _ = MainThreadLog.add("reader.body", ms: 0)
+        let _ = MainThreadLog.readerBody()
         #endif
         baseContent
     }

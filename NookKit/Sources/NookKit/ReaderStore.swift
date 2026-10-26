@@ -3796,7 +3796,13 @@ public final class ReaderStore {
         }
     }
 
-    public func refresh(feedID: Feed.ID) {
+    #if DEBUG
+    /// `refresh(feedID:)` for the app's perf driver, without widening the
+    /// release API.
+    public func perfRefresh(feedID: Feed.ID) { refresh(feedID: feedID) }
+    #endif
+
+    func refresh(feedID: Feed.ID) {
         guard !isPreparingLocalReset, feed(for: feedID) != nil else { return }
         feedSelection = [feedID]
 
@@ -4206,8 +4212,15 @@ public final class ReaderStore {
                 let storage = ReaderStorage(directoryURL: directoryURL)
                 self.storage = storage
                 syncFolderDisplayPath = directoryURL.path(percentEncoded: false)
-                try await bringSyncFolderOnline(storage: storage, directoryURL: directoryURL)
+                // The replica database lives inside the perf folder, so the
+                // run script's `rsync --delete` restore resets it with the files;
+                // the default Application Support location would outlive the
+                // restore and reconcile would prefer an earlier run's merges.
+                let replicaDirectory = directoryURL.appending(path: ".nook-perf-replica", directoryHint: .isDirectory)
+                try await bringSyncFolderOnline(
+                    storage: storage, directoryURL: directoryURL, replicaDirectory: replicaDirectory)
                 #if os(macOS)
+                MainThreadLog.note("perf.replica", extra: "dir=\(replicaDirectory.path(percentEncoded: false))")
                 MainThreadLog.note(
                     "perf.library",
                     extra: "articles=\(articles.count) unread=\(articles.filter { !$0.isRead }.count) starred=\(articles.filter(\.isStarred).count) feeds=\(feeds.count)")
@@ -4262,7 +4275,7 @@ public final class ReaderStore {
     }
 
     nonisolated private static func loadSyncFolder(
-        storage: ReaderStorage, directoryURL: URL, deviceID: String,
+        storage: ReaderStorage, directoryURL: URL, deviceID: String, replicaDirectory: URL? = nil,
         onPhase: @escaping @Sendable (BootstrapPhase) -> Void = { _ in }
     ) throws -> SyncFolderLoad {
         let own: DeviceStateDocument
@@ -4275,7 +4288,8 @@ public final class ReaderStore {
             try? storage.saveShard(own)
         }
         onPhase(.readingLibrary)
-        let replica = try ReplicaStore(syncDirectory: directoryURL, deviceID: deviceID)
+        let replica = try ReplicaStore(
+            syncDirectory: directoryURL, deviceID: deviceID, databaseDirectory: replicaDirectory)
         let snapshot = try replica.reconcile(storage: storage)
         try replica.publishIfNeeded(to: storage)
         // The one-time v1→v2 user-state seed is rare; the main actor runs the
@@ -4306,13 +4320,17 @@ public final class ReaderStore {
     /// the fully synchronous legacy sequence when a local mutation raced the
     /// off-main load (pathological — the UI is barely interactive at these
     /// moments) or when the one-time legacy state seed is pending.
-    private func bringSyncFolderOnline(storage: ReaderStorage, directoryURL: URL) async throws {
+    private func bringSyncFolderOnline(
+        storage: ReaderStorage, directoryURL: URL, replicaDirectory: URL? = nil
+    ) async throws {
         let deviceID = deviceID
         let generationBefore = ownShard.generation
         bootstrapPhase = .connectingFolder
         defer { bootstrapPhase = nil }
         let load = try await Task.detached(priority: .userInitiated) { [weak self] in
-            try Self.loadSyncFolder(storage: storage, directoryURL: directoryURL, deviceID: deviceID) { phase in
+            try Self.loadSyncFolder(
+                storage: storage, directoryURL: directoryURL, deviceID: deviceID, replicaDirectory: replicaDirectory
+            ) { phase in
                 Task { @MainActor in self?.bootstrapPhase = phase }
             }
         }.value

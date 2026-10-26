@@ -18,7 +18,10 @@ import NookKit
 /// selectCategory/search/refreshAll/refreshFeed/refreshActivation/selectIndex/
 /// setRead/toggleStar/nextArticle/fling/thumbDrag/constantScroll/keyRepeat/
 /// classifyAll/wait/noop. Optional action fields are `target`, `ids`, `value`,
-/// `index`, `count`, `rate`, and `duration` (seconds).
+/// `index`, `count`, `rate`, and `duration` (seconds). `coldFirst` adds a rep 0
+/// recorded as `cold=1`; set it only on the step that really runs first after
+/// launch. An unresolvable target or a missing list logs `perf.driver.error`,
+/// which makes the run invalid.
 @MainActor
 final class PerfDriver {
     static let shared = PerfDriver()
@@ -54,7 +57,7 @@ final class PerfDriver {
         didRun = true
         do {
             let script = try JSONDecoder().decode(Script.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-            fixWindowSize()
+            try await fixLayout()
             let adapter = PerfStoreAdapter(store: store)
             for step in script.steps {
                 let repetitions = max(1, step.repetitions ?? script.repetitions ?? 5)
@@ -75,14 +78,16 @@ final class PerfDriver {
 
     private func run(step: Step, rep: Int, cold: Bool, adapter: PerfStoreAdapter) async throws {
         for action in step.setup ?? [] { try await perform(action, adapter: adapter) }
-        try await settle(adapter: adapter)
+        try await settle(adapter: adapter, id: step.id)
         MainThreadLog.scenarioBegin(id: step.id, rep: rep, cold: cold)
+        PerfListScrollTarget.setRecording(true)
         try await perform(step.action, adapter: adapter)
-        try await quiesce(adapter: adapter)
-        MainThreadLog.scenarioEnd()
+        let activeEnd = try await quiesce(adapter: adapter, id: step.id)
+        PerfListScrollTarget.setRecording(false)
+        MainThreadLog.scenarioEnd(activeEnd: activeEnd)
     }
 
-    private func settle(adapter: PerfStoreAdapter) async throws {
+    private func settle(adapter: PerfStoreAdapter, id: String) async throws {
         var stableSince = ProcessInfo.processInfo.systemUptime
         let deadline = stableSince + 30
         while ProcessInfo.processInfo.systemUptime < deadline {
@@ -94,19 +99,28 @@ final class PerfDriver {
             }
             try await Task.sleep(for: .milliseconds(50))
         }
+        MainThreadLog.note("perf.settle.timeout", extra: "id=\(id)")
     }
 
-    private func quiesce(adapter: PerfStoreAdapter) async throws {
+    /// Waits for 1.5s with no refresh, publish, settle or stall, and returns when
+    /// the workload last showed activity — the end of the scenario's active window.
+    /// Stability is checked before the deadline, so a stall that outlasts the
+    /// deadline but has ended is not reported as a timeout.
+    private func quiesce(adapter: PerfStoreAdapter, id: String) async throws -> Double {
         var stableSince = ProcessInfo.processInfo.systemUptime
         let deadline = stableSince + 30
-        while ProcessInfo.processInfo.systemUptime < deadline {
+        while true {
             let now = ProcessInfo.processInfo.systemUptime
             if adapter.isRefreshing {
                 stableSince = now
-            } else if MainThreadLog.lastPublishAt > stableSince {
-                stableSince = MainThreadLog.lastPublishAt
+            } else if MainThreadLog.lastActivityAt > stableSince {
+                stableSince = MainThreadLog.lastActivityAt
             } else if now - stableSince >= 1.5 {
-                return
+                return stableSince
+            }
+            if now >= deadline {
+                MainThreadLog.note("perf.quiesce.timeout", extra: "id=\(id)")
+                return stableSince
             }
             try await Task.sleep(for: .milliseconds(50))
         }
@@ -124,9 +138,15 @@ final class PerfDriver {
         case "refreshFeed": adapter.refreshFeed(action.target ?? "feed-big")
         case "refreshActivation": adapter.refreshActivation()
         case "selectIndex": adapter.selectArticle(index: action.index ?? 0)
-        case "setRead": adapter.setSelectedRead((action.value ?? "true") != "false")
-        case "toggleStar": adapter.toggleSelectedStar()
-        case "nextArticle": adapter.nextArticle()
+        case "setRead":
+            MainThreadLog.scenarioValue("toggles", 1)
+            adapter.setSelectedRead((action.value ?? "true") != "false")
+        case "toggleStar":
+            MainThreadLog.scenarioValue("toggles", 1)
+            adapter.toggleSelectedStar()
+        case "nextArticle":
+            MainThreadLog.scenarioValue("toggles", 1)
+            adapter.nextArticle()
         case "latestWins":
             adapter.selectSmart("all")
             try await Task.sleep(for: .milliseconds(100))
@@ -136,22 +156,28 @@ final class PerfDriver {
             try await Task.sleep(for: .milliseconds(500))
             adapter.setSearch("")
         case "toggleRead":
+            MainThreadLog.scenarioValue("toggles", action.count ?? 20)
             for _ in 0..<(action.count ?? 20) {
                 adapter.toggleSelectedRead()
                 try await Task.sleep(for: .seconds(1 / max(1, action.rate ?? 2)))
             }
         case "toggleStarRepeat":
+            MainThreadLog.scenarioValue("toggles", action.count ?? 20)
             for _ in 0..<(action.count ?? 20) {
                 adapter.toggleSelectedStar()
                 try await Task.sleep(for: .seconds(1 / max(1, action.rate ?? 2)))
             }
         case "nextRepeat":
+            MainThreadLog.scenarioValue("toggles", action.count ?? 20)
             for _ in 0..<(action.count ?? 20) { adapter.nextArticle(); try await Task.sleep(for: .milliseconds(100)) }
         case "refreshAndFling": adapter.refreshAll(); try await fling(count: action.count ?? 8)
         case "fling": try await fling(count: action.count ?? 8)
         case "thumbDrag": try await thumbDrag(steps: action.count ?? 30, duration: action.duration ?? 1)
         case "constantScroll": try await constantScroll(rate: action.rate ?? 1500, duration: action.duration ?? 5)
-        case "keyRepeat": try await keyRepeat(command: action.target == "commandDown", rate: action.rate ?? 30, duration: action.duration ?? 5)
+        case "keyRepeat":
+            try await keyRepeat(
+                command: action.target == "commandDown", rate: action.rate ?? 30,
+                duration: action.duration ?? 5, adapter: adapter)
         case "classifyAll": adapter.classifyAll()
         case "wait": try await Task.sleep(for: .seconds(action.duration ?? 1))
         case "noop": break
@@ -159,20 +185,30 @@ final class PerfDriver {
         }
     }
 
+    private func listScrollView(for action: String) -> NSScrollView? {
+        guard let scrollView = PerfListScrollTarget.scrollView else {
+            MainThreadLog.note("perf.driver.error", extra: "action=\(action) reason=no_list_scroll_view")
+            return nil
+        }
+        return scrollView
+    }
+
+    /// One move per display-link callback, so the per-frame workload is the same
+    /// on every run whatever the timer slack.
     private func fling(count: Int) async throws {
-        guard let scrollView = PerfListScrollTarget.scrollView else { return }
+        guard let scrollView = listScrollView(for: "fling") else { return }
         for _ in 0..<count {
             var velocity = 6_000.0
             while velocity > 40 {
                 move(scrollView, by: velocity / displayHz)
                 velocity *= 0.95
-                try await nextFrame()
+                await PerfListScrollTarget.nextFrame()
             }
         }
     }
 
     private func thumbDrag(steps: Int, duration: Double) async throws {
-        guard let scrollView = PerfListScrollTarget.scrollView else { return }
+        guard let scrollView = listScrollView(for: "thumbDrag") else { return }
         let maxY = scrollLimit(scrollView)
         for step in 1...max(1, steps) {
             move(scrollView, to: maxY * Double(step) / Double(max(1, steps)))
@@ -182,26 +218,52 @@ final class PerfDriver {
     }
 
     private func constantScroll(rate: Double, duration: Double) async throws {
-        guard let scrollView = PerfListScrollTarget.scrollView else { return }
+        guard let scrollView = listScrollView(for: "constantScroll") else { return }
         let frames = Int(duration * displayHz)
-        for _ in 0..<max(1, frames) { move(scrollView, by: rate / displayHz); try await nextFrame() }
+        for _ in 0..<max(1, frames) { move(scrollView, by: rate / displayHz); await PerfListScrollTarget.nextFrame() }
     }
 
-    private func keyRepeat(command: Bool, rate: Double, duration: Double) async throws {
-        let repeats = Int(rate * duration)
-        for _ in 0..<max(1, repeats) {
-            if let event = NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: command ? [.command] : [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: NSApp.keyWindow?.windowNumber ?? 0,
-                context: nil, characters: "\u{F701}", charactersIgnoringModifiers: "\u{F701}",
-                isARepeat: true, keyCode: 125
-            ) { NSApp.postEvent(event, atStart: false) }
+    /// Posts ↓ (or ⌘↓) to the article table, which is made first responder first
+    /// so the sidebar can never take the keys. Moves are counted from the
+    /// selection's index, and `missedSelection = posted − moved`.
+    private func keyRepeat(command: Bool, rate: Double, duration: Double, adapter: PerfStoreAdapter) async throws {
+        guard let tableView = PerfListScrollTarget.tableView, let window = tableView.window else {
+            MainThreadLog.note("perf.driver.error", extra: "action=keyRepeat reason=no_article_table")
+            return
+        }
+        window.makeFirstResponder(tableView)
+        let startIndex = adapter.selectedIndex
+        let repeats = max(1, Int(rate * duration))
+        for index in 0..<repeats {
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                if let event = NSEvent.keyEvent(
+                    with: type, location: .zero, modifierFlags: command ? [.command] : [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, characters: "\u{F701}", charactersIgnoringModifiers: "\u{F701}",
+                    isARepeat: type == .keyDown && index > 0, keyCode: 125
+                ) { NSApp.postEvent(event, atStart: false) }
+            }
             try await Task.sleep(for: .seconds(1 / max(1, rate)))
         }
+        // Let the queued events drain: the selection must hold still for 1s (up
+        // to 15s) before it is read.
+        var last = adapter.selectedIndex
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        let drainDeadline = stableSince + 15
+        while ProcessInfo.processInfo.systemUptime - stableSince < 1, ProcessInfo.processInfo.systemUptime < drainDeadline {
+            try await Task.sleep(for: .milliseconds(100))
+            if adapter.selectedIndex != last { last = adapter.selectedIndex; stableSince = ProcessInfo.processInfo.systemUptime }
+        }
+        let moved = max(0, (adapter.selectedIndex ?? 0) - (startIndex ?? 0))
+        MainThreadLog.scenarioValue("keysPosted", repeats)
+        MainThreadLog.scenarioValue("keysMoved", moved)
+        MainThreadLog.scenarioValue("missedSelection", repeats - moved)
+        MainThreadLog.note(
+            "perf.keys",
+            extra: "posted=\(repeats) moved=\(moved) responder=\(window.firstResponder === tableView ? "table" : "other")")
     }
 
     private var displayHz: Double { Double(NSScreen.main?.maximumFramesPerSecond ?? 60) }
-    private func nextFrame() async throws { try await Task.sleep(for: .seconds(1 / displayHz)) }
     private func scrollLimit(_ scrollView: NSScrollView) -> Double {
         max(0, Double((scrollView.documentView?.bounds.height ?? 0) - scrollView.contentView.bounds.height))
     }
@@ -214,12 +276,49 @@ final class PerfDriver {
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
-    private func fixWindowSize() {
-        guard let window = NSApp.windows.first(where: { $0.isVisible }) ?? NSApp.windows.first else { return }
+    /// Fixes the window at 1440×900 and the sidebar/list columns at their ideal
+    /// widths (270/420), since visible rows = visible height × list width. Frame
+    /// and divider autosave are switched off first so none of this is written
+    /// into the app's defaults.
+    private func fixLayout() async throws {
+        guard let window = NSApp.windows.first(where: { $0.isVisible }) ?? NSApp.windows.first else {
+            MainThreadLog.note("perf.driver.error", extra: "action=layout reason=no_window")
+            return
+        }
+        window.setFrameAutosaveName("")
         window.setContentSize(NSSize(width: 1440, height: 900))
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        // Let the resize lay out before the dividers are placed against it.
+        try await Task.sleep(for: .milliseconds(300))
+        guard let splitView = Self.outerSplitView(in: window.contentView), splitView.arrangedSubviews.count >= 3 else {
+            MainThreadLog.note("perf.driver.error", extra: "action=layout reason=no_split_view")
+            return
+        }
+        splitView.autosaveName = nil
+        splitView.setPosition(270, ofDividerAt: 0)
+        splitView.setPosition(270 + splitView.dividerThickness + 420, ofDividerAt: 1)
+        splitView.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(300))
+        // The macOS 26 sidebar floats over the content column, whose frame starts
+        // at x=0, so the list's visible width is from the sidebar's edge to the
+        // detail column.
+        let arranged = splitView.arrangedSubviews
+        let listWidth = arranged[2].frame.minX - splitView.dividerThickness - arranged[0].frame.maxX
+        let widths = arranged.map {
+            "\(Int($0.frame.minX))+\(Int($0.frame.width.rounded()))\($0.isHidden ? "h" : "")"
+        }
+        MainThreadLog.note("perf.layout", extra: "window=\(Int(window.frame.width))x\(Int(window.frame.height)) listWidth=\(Int(listWidth)) columns=\(widths.joined(separator: ","))")
+    }
+
+    private static func outerSplitView(in view: NSView?) -> NSSplitView? {
+        guard let view else { return nil }
+        if let splitView = view as? NSSplitView, splitView.arrangedSubviews.count >= 3 { return splitView }
+        for subview in view.subviews {
+            if let found = outerSplitView(in: subview) { return found }
+        }
+        return nil
     }
 
     private func launchValue(_ key: String) -> String? {
@@ -237,21 +336,33 @@ private struct PerfStoreAdapter {
     func selectSmart(_ raw: String) {
         if let source = SmartSource(rawValue: raw) { store.selectSmartSource(source) }
     }
+    var selectedIndex: Int? {
+        store.selectedArticleID.flatMap { id in store.visibleArticles.firstIndex { $0.id == id } }
+    }
+
     func selectFeeds(_ targets: [String]) {
         let ids = targets.flatMap(resolveFeedTarget)
         store.feedSelection = Set(ids)
     }
-    func selectFolder(_ target: String) { store.selectFolder(resolveIndexed(target, prefix: "Folder ", count: 12)) }
+    func selectFolder(_ target: String) {
+        let folder = resolveIndexed(target, prefix: "Folder ", count: 12)
+        guard !store.feeds(inFolder: folder).isEmpty else { return invalid("folder", target) }
+        store.selectFolder(folder)
+    }
+    /// `"1"`, `"category-1"` and `"perf-cat-1"` all mean the generator's `perf-cat-1`.
     func selectCategory(_ target: String) {
-        let index = max(0, (Int(target.replacingOccurrences(of: "category-", with: "")) ?? 1) - 1)
-        if store.categories.indices.contains(index) { store.selectCategory(store.categories[index].id) }
+        let id = target.hasPrefix("perf-cat-")
+            ? target : "perf-cat-" + target.replacingOccurrences(of: "category-", with: "")
+        guard store.categories.contains(where: { $0.id == id }) else { return invalid("category", target) }
+        store.selectCategory(id)
     }
     func setSearch(_ value: String) { store.searchText = value; store.debounceSearch() }
     func refreshAll() { store.refreshAll() }
-    func refreshFeed(_ target: String) { resolveFeedTarget(target).first.map(store.refresh(feedID:)) }
+    func refreshFeed(_ target: String) { resolveFeedTarget(target).first.map(store.perfRefresh(feedID:)) }
     func refreshActivation() { store.refreshOnActivation(honorThrottle: false) }
     func selectArticle(index: Int) {
-        guard store.visibleArticles.indices.contains(index) else { return }
+        guard store.visibleArticles.indices.contains(index) else { return invalid("index", String(index)) }
+        MainThreadLog.articleSelectionBegan()
         store.selectedArticleID = store.visibleArticles[index].id
     }
     func setSelectedRead(_ value: Bool) { store.selectedArticleID.map { store.setRead(articleID: $0, isRead: value) } }
@@ -260,18 +371,30 @@ private struct PerfStoreAdapter {
         store.setRead(articleID: id, isRead: !article.isRead)
     }
     func toggleSelectedStar() { store.selectedArticleID.map(store.toggleStarred(articleID:)) }
-    func nextArticle() { store.selectNextArticle() }
+    func nextArticle() {
+        MainThreadLog.articleSelectionBegan()
+        store.selectNextArticle()
+    }
     func classifyAll() { store.classifyAllExisting(provider: .appleIntelligence) }
+
+    private func invalid(_ kind: String, _ target: String) {
+        MainThreadLog.note("perf.driver.error", extra: "\(kind)=\(target.replacingOccurrences(of: " ", with: "_")) reason=not_found")
+    }
 
     private func resolveFeedTarget(_ target: String) -> [Feed.ID] {
         switch target {
-        case "feed-small": return ["perf-feed-small"]
-        case "feed-big": return ["perf-feed-big"]
+        case "feed-small": return resolved(["perf-feed-small"], target)
+        case "feed-big": return resolved(["perf-feed-big"], target)
         case "all": return store.feeds.map(\.id)
         default:
             if target.hasPrefix("first:"), let count = Int(target.dropFirst(6)) { return Array(store.feeds.prefix(count).map(\.id)) }
-            return [target]
+            return resolved([target], target)
         }
+    }
+    private func resolved(_ ids: [Feed.ID], _ target: String) -> [Feed.ID] {
+        let known = ids.filter { id in store.feeds.contains { $0.id == id } }
+        if known.count != ids.count { invalid("feed", target) }
+        return known
     }
     private func resolveIndexed(_ target: String, prefix: String, count: Int) -> String {
         if target.hasPrefix(prefix) { return target }

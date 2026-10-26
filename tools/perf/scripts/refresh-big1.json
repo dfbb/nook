@@ -1,0 +1,6 @@
+{
+  "repetitions": 1,
+  "steps": [
+    {"id":"B4","setup":[{"type":"selectFeed","target":"feed-big"}],"action":{"type":"refreshFeed","target":"feed-big"}}
+  ]
+}

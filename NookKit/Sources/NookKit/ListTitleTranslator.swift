@@ -49,6 +49,12 @@ public final class ListTitleTranslator {
 
         fileprivate init(state: TitleState? = nil) { self.state = state }
 
+        #if DEBUG && os(macOS)
+        // Boxes are interned for the translator's lifetime, so this staying at 0
+        // while `list.title.box` grows is the lifetime being measured.
+        deinit { MainThreadLog.add("list.title.box.release", ms: 0) }
+        #endif
+
         func setState(_ newState: TitleState?) {
             guard state != newState else { return }
             state = newState

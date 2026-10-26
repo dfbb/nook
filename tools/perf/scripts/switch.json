@@ -1,8 +1,7 @@
 {
   "repetitions": 5,
-  "coldFirst": true,
   "steps": [
-    {"id":"A1","setup":[{"type":"selectFeed","target":"feed-small"}],"action":{"type":"selectSmart","target":"all"}},
+    {"id":"A1","coldFirst":true,"setup":[{"type":"selectFeed","target":"feed-small"}],"action":{"type":"selectSmart","target":"all"}},
     {"id":"A2","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectSmart","target":"unread"}},
     {"id":"A3","setup":[{"type":"selectSmart","target":"unread"}],"action":{"type":"selectSmart","target":"all"}},
     {"id":"A4","setup":[{"type":"selectSmart","target":"all"}],"action":{"type":"selectSmart","target":"starred"}},

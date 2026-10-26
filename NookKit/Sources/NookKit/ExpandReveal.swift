@@ -128,7 +128,9 @@ private struct MacListRowHeightInvalidator: NSViewRepresentable {
             // all of it beginning while an input event was being handled — which is
             // what scrolling is.
             MainThreadLog.add("list.row.height", ms: 0)
-            MainThreadLog.add("list.row.height.flush", ms: 0)
+            // Run-loop turns that invalidated any row height: one per turn is the
+            // coalescing target, so flush < rowHeight is the healthy shape.
+            MainThreadLog.addOncePerTurn("list.row.height.flush")
             #endif
             invalidateHostingHierarchy()
 
