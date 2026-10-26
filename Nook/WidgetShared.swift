@@ -56,8 +56,7 @@ enum WidgetShared {
         defaults.set(data, forKey: todayNewsKey)
     }
 
-    /// Decodes and returns the cached today-news list, or an empty array when
-    /// the App Group isn't available or the data hasn't been written yet.
+    /// 读取缓存的今日新闻列表。App Group 不可用或尚未写入时返回空数组。
     static func readTodayNews() -> [TodayNewsItem] {
         guard let defaults = appGroupDefaults,
               let data = defaults.data(forKey: todayNewsKey),
