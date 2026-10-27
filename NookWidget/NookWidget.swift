@@ -92,32 +92,61 @@ private struct NookWidgetView: View {
 
 struct TodayNewsEntry: TimelineEntry {
     let date: Date
-    let articles: [TodayNewsItem]
+    let articles: [TodayNewsItem]   // current page of 8
+    let pageIndex: Int               // which page (0-based) for footer display
+    let totalCount: Int              // total articles across all pages
     var isPlaceholder: Bool = false
 }
 
 struct TodayNewsProvider: TimelineProvider {
+    /// How many articles to show per page — reduced to fit larger font
+    static let pageSize = 5
+    /// Rotate every 60 seconds
+    static let rotateInterval: TimeInterval = 60
+
     func placeholder(in context: Context) -> TodayNewsEntry {
-        TodayNewsEntry(date: .now, articles: Self.placeholderItems, isPlaceholder: true)
+        TodayNewsEntry(date: .now, articles: Self.placeholderItems,
+                       pageIndex: 0, totalCount: Self.placeholderItems.count, isPlaceholder: true)
     }
 
     func getSnapshot(in context: Context, completion: @escaping (TodayNewsEntry) -> Void) {
-        let items = WidgetShared.readTodayNews()
-        let entry = TodayNewsEntry(
-            date: .now,
-            articles: (context.isPreview && items.isEmpty) ? Self.placeholderItems : items
-        )
-        completion(entry)
+        let all = WidgetShared.readTodayNews()
+        let items = context.isPreview && all.isEmpty ? Self.placeholderItems : all
+        let page = items.isEmpty ? [] : Array(items.prefix(Self.pageSize))
+        completion(TodayNewsEntry(date: .now, articles: page,
+                                  pageIndex: 0, totalCount: items.count))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<TodayNewsEntry>) -> Void) {
-        let items = WidgetShared.readTodayNews()
-        let entry = TodayNewsEntry(date: .now, articles: items)
-        let midnight = Calendar.current.startOfDay(for: Date().addingTimeInterval(24 * 60 * 60))
-        completion(Timeline(entries: [entry], policy: .after(midnight)))
+        let all = WidgetShared.readTodayNews()
+        guard !all.isEmpty else {
+            // No articles: single entry, refresh at midnight
+            let midnight = Calendar.current.startOfDay(for: Date().addingTimeInterval(24 * 60 * 60))
+            let entry = TodayNewsEntry(date: .now, articles: [],
+                                       pageIndex: 0, totalCount: 0)
+            completion(Timeline(entries: [entry], policy: .after(midnight)))
+            return
+        }
+
+        // Build one entry per page, each 60 seconds apart
+        let now = Date()
+        let pageCount = Int(ceil(Double(all.count) / Double(Self.pageSize)))
+        var entries: [TodayNewsEntry] = []
+        for i in 0..<pageCount {
+            let start = i * Self.pageSize
+            let end   = min(start + Self.pageSize, all.count)
+            let page  = Array(all[start..<end])
+            let entryDate = now.addingTimeInterval(Double(i) * Self.rotateInterval)
+            entries.append(TodayNewsEntry(date: entryDate, articles: page,
+                                          pageIndex: i, totalCount: all.count))
+        }
+
+        // After all pages shown, refresh again (cycle through at the same pace)
+        let refreshDate = now.addingTimeInterval(Double(pageCount) * Self.rotateInterval)
+        completion(Timeline(entries: entries, policy: .after(refreshDate)))
     }
 
-    private static let placeholderItems: [TodayNewsItem] = (1...8).map { i in
+    private static let placeholderItems: [TodayNewsItem] = (1...5).map { i in
         TodayNewsItem(
             id: "\(i)",
             title: "今日新闻标题示例将显示在这里 \(i)",
@@ -139,7 +168,7 @@ struct TodayNewsWidget: Widget {
         }
         .configurationDisplayName("今日新闻")
         .description("一览今天收到的文章标题。")
-        .supportedFamilies([.systemLarge])
+        .supportedFamilies([.systemMedium, .systemLarge])
     }
 }
 
@@ -158,20 +187,20 @@ private struct TodayNewsWidgetView: View {
             Spacer(minLength: 0)
             footer
         }
-        .widgetURL(WidgetShared.sourceURL(.today))
+        // No widgetURL: each Link() opens the article URL directly in the browser
     }
 
     private var header: some View {
         HStack(spacing: 6) {
             Image(systemName: "newspaper.fill")
-                .font(.caption)
+                .font(.footnote)
                 .foregroundStyle(.tint)
             Text("今日新闻")
                 .font(.headline)
             Spacer(minLength: 0)
             if !entry.articles.isEmpty {
                 Text("\(entry.articles.count)条")
-                    .font(.caption2)
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
         }
@@ -179,7 +208,7 @@ private struct TodayNewsWidgetView: View {
 
     private var emptyState: some View {
         Text("今天暂无新文章。")
-            .font(.caption)
+            .font(.footnote)
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .center)
     }
@@ -190,23 +219,23 @@ private struct TodayNewsWidgetView: View {
                 Link(destination: item.url) {
                     HStack(alignment: .top, spacing: 6) {
                         Circle()
-                            .fill(.tint.opacity(0.6))
-                            .frame(width: 4, height: 4)
-                            .padding(.top, 4)
-                        VStack(alignment: .leading, spacing: 1) {
+                            .fill(.tint.opacity(0.7))
+                            .frame(width: 5, height: 5)
+                            .padding(.top, 5)
+                        VStack(alignment: .leading, spacing: 2) {
                             Text(item.title)
-                                .font(.caption)
+                                .font(.callout)
                                 .lineLimit(2)
                                 .multilineTextAlignment(.leading)
                                 .foregroundStyle(entry.isPlaceholder ? .secondary : .primary)
                             Text(item.feedTitle)
-                                .font(.caption2)
+                                .font(.footnote)
                                 .lineLimit(1)
                                 .foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 5)
                 }
                 .buttonStyle(.plain)
 
@@ -220,14 +249,20 @@ private struct TodayNewsWidgetView: View {
     private var footer: some View {
         HStack(spacing: 4) {
             Image(systemName: "books.vertical.fill")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.tertiary)
             Text("Nook")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 0)
+            if entry.totalCount > TodayNewsProvider.pageSize {
+                let pages = Int(ceil(Double(entry.totalCount) / Double(TodayNewsProvider.pageSize)))
+                Text("\(entry.pageIndex + 1)/\(pages)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
             Text(entry.date, style: .time)
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.tertiary)
         }
         .padding(.top, 4)
