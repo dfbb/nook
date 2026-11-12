@@ -15,10 +15,5 @@
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER)-spks</string>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER)-spki</string>
 	</array>
-	<!-- Widget data cache shared with the widget extension (no App Group required). -->
-	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
-	<array>
-		<string>Library/Application Support/nook-widget/</string>
-	</array>
 </dict>
 </plist>

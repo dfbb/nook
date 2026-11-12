@@ -41,12 +41,13 @@ enum WidgetShared {
     /// The WidgetKit kind string for the Today News widget.
     static let todayNewsWidgetKind = "NookTodayNewsWidget"
 
-    /// File-based cache shared between the main app and the widget extension via
-    /// a `temporary-exception.files.home-relative-path.read-write` entitlement.
-    /// Falls back gracefully (empty list / silent drop) when the path is inaccessible.
+    /// File-based cache: the main app writes to its own sandbox container;
+    /// the widget extension reads from the same absolute path using a
+    /// `temporary-exception.files.absolute-path.read-only` entitlement.
+    /// Both sides use `NSUserName()` so the path works for any login account.
     private static var cacheFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/nook-widget/today-news.json")
+        // /Users/<user>/Library/Containers/com.tim.nook/Data/Library/Application Support/nook-widget/today-news.json
+        URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/com.tim.nook/Data/Library/Application Support/nook-widget/today-news.json")
     }
 
     /// Encodes `items` and writes them to the shared cache file so the widget

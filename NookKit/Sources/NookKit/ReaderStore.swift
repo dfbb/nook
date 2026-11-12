@@ -5550,8 +5550,14 @@ public final class ReaderStore {
         Task.detached(priority: .utility) {
             let todayNewsWidgetKind = "NookTodayNewsWidget"
             guard let data = try? JSONEncoder().encode(payload) else { return }
-            let dir = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/nook-widget")
+            // Write to the app's own sandbox container — always allowed, no
+            // special entitlement needed. The widget reads from this same
+            // absolute path via a temporary-exception.files.absolute-path
+            // read-only entitlement.
+            let appSupport = FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+                .first ?? FileManager.default.temporaryDirectory
+            let dir = appSupport.appendingPathComponent("nook-widget")
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let file = dir.appendingPathComponent("today-news.json")
             try? data.write(to: file, options: .atomic)
