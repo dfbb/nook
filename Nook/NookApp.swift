@@ -2,6 +2,7 @@ import AppKit
 import NookKit
 import SwiftUI
 import UserNotifications
+import WidgetKit
 
 @main
 struct NookApp: App {
@@ -15,6 +16,9 @@ struct NookApp: App {
         // a relaunch is still required.
         AppLanguage.applyStoredPreference()
         _ = AppLanguage.launchLanguage
+        // Ping WidgetKit so the system launches the extension and discovers all
+        // widget kinds (including newly added ones like TodayNewsWidget).
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     var body: some Scene {
