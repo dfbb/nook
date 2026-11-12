@@ -19,6 +19,11 @@ struct NookApp: App {
         // Ping WidgetKit so the system launches the extension and discovers all
         // widget kinds (including newly added ones like TodayNewsWidget).
         WidgetCenter.shared.reloadAllTimelines()
+        // Before the first filter runs, so its rows are measured off the main thread.
+        if MacListBackend.current == .table {
+            ArticleRowTextWidths.prepareFonts()
+            ArticleRowTextWidths.prefillEnabled.store(true, ordering: .relaxed)
+        }
     }
 
     var body: some Scene {

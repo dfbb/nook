@@ -84,8 +84,20 @@ public final class ListTitleTranslator {
     /// its `state`. Interning a new box mutates a non-observed dictionary, so it's
     /// safe to call from a view body (no "publishing during view update").
     public func box(for id: Article.ID) -> StateBox {
+        box(for: id, seed: nil)
+    }
+
+    /// The box for a row whose body is being built. A box made here (first sight,
+    /// or after `releaseIdleBoxes`) is seeded from the cache, so a re-created row
+    /// is full-height on its first layout like the one it replaces.
+    public func box(for id: Article.ID, title: String) -> StateBox {
         if let existing = boxes[id] { return existing }
-        let created = StateBox()
+        return box(for: id, seed: cachedState(for: title))
+    }
+
+    private func box(for id: Article.ID, seed: TitleState?) -> StateBox {
+        if let existing = boxes[id] { return existing }
+        let created = StateBox(state: seed)
         boxes[id] = created
         #if DEBUG && os(macOS)
         MainThreadLog.add("list.title.box", ms: 0)
@@ -93,11 +105,59 @@ public final class ListTitleTranslator {
         return created
     }
 
+    /// Drops every box no work is pending on. Called when the macOS list replaces
+    /// its identity, before the new rows' first body: no row view holds an old box
+    /// any more, and the new rows intern fresh, cache-seeded ones. A box with a
+    /// dwell or an in-flight translation stays, so its result still lands.
+    /// (Not on `rowDisappeared`: a hidden row's hosting cell can be shown again
+    /// without its body re-running, and it would keep observing a dropped box.)
+    public func releaseIdleBoxes() {
+        boxes = boxes.filter { id, _ in activeTasks[id] != nil || dwellTasks[id] != nil }
+    }
+
+    var boxCount: Int { boxes.count }
+
+    #if DEBUG
+    /// Turns the coordinator on with an in-memory cache entry, without a model,
+    /// the disk cache or the save that `rememberTranslation` schedules.
+    func _enableForTesting(targetLanguageCode: String, cached: [String: String] = [:]) {
+        enabled = true
+        loadedFromDisk = true
+        self.targetLanguageCode = targetLanguageCode
+        for (title, translation) in cached { cache[cacheKey(for: title)] = translation }
+    }
+
+    /// Opens the post-enable window `configure` opens when the feature turns on.
+    func _markJustEnabledForTesting() {
+        immediateUntil = .now + immediateWindow
+    }
+
+    /// Where `id` is in the scheduling pipeline.
+    func _schedulingForTesting(_ id: Article.ID) -> String {
+        if activeTasks[id] != nil { return "active" }
+        if pending.contains(where: { $0.id == id }) { return "pending" }
+        if dwellTasks[id] != nil { return "dwell" }
+        return "none"
+    }
+
+    /// A worker result landing for `id`, as `startTranslate` delivers it.
+    func _deliverForTesting(_ state: TitleState?, for id: Article.ID) {
+        setState(state, for: id)
+    }
+    #endif
+
     private func liveState(for id: Article.ID) -> TitleState? { boxes[id]?.state }
 
+    /// Writes only an existing box. A row interns its box before its first body,
+    /// so a missing box means no row shows this id: a late result goes to the
+    /// cache alone instead of creating an orphan box nobody observes.
     private func setState(_ newState: TitleState?, for id: Article.ID) {
-        let box = box(for: id)
-        box.setState(newState)
+        boxes[id]?.setState(newState)
+    }
+
+    private func cachedState(for title: String) -> TitleState? {
+        guard enabled, !title.isEmpty, let cached = cache[cacheKey(for: title)] else { return nil }
+        return .translated(cached, provider: provider)
     }
 
     // Device-local caches (never synced), persisted to Application Support so a
@@ -125,6 +185,18 @@ public final class ListTitleTranslator {
     /// Rows currently on screen, with their latest title. Lets `finish` reschedule
     /// a row that disappeared and reappeared while its cancelled task wound down.
     private var visibleTitles: [Article.ID: String] = [:]
+    /// How many row views currently show each visible id. Turning translation on
+    /// or off rebuilds the macOS List, so for a moment the old table's row and the
+    /// new table's row are both "on screen", and AppKit does not promise which of
+    /// their appear/disappear callbacks comes first. Counting keeps a row visible
+    /// (and its queued or running translation alive) until the last of them goes.
+    private var visibleCounts: [Article.ID: Int] = [:]
+    /// Until this instant, a row appearing skips the dwell: the feature was just
+    /// turned on (or retargeted), and the rows appearing are the ones already on
+    /// screen, re-created by the List rebuild, not rows scrolled into view.
+    private var immediateUntil: ContinuousClock.Instant?
+    /// How long after enabling an appearing row counts as already being looked at.
+    private let immediateWindow: Duration = .seconds(1)
 
     private var loadedFromDisk = false
     /// In-flight off-main cache load; `fillSlots` holds translation starts until
@@ -189,6 +261,7 @@ public final class ListTitleTranslator {
         // rows already on screen now — without waiting for a dwell — so the list
         // the user is looking at updates immediately instead of only after scroll.
         if self.enabled, !wasEnabled || languageChanged || providerChanged {
+            immediateUntil = .now + immediateWindow
             for (id, title) in visibleTitles {
                 scheduleTranslation(id: id, title: title, afterDwell: false)
             }
@@ -203,11 +276,13 @@ public final class ListTitleTranslator {
     /// observation dependency, because the coordinator isn't `@Observable`.
     public func state(for box: StateBox, title: String) -> TitleState? {
         if let live = box.state { return live }
-        guard enabled, !title.isEmpty else { return nil }
-        if let cached = cache[cacheKey(for: title)] {
-            return .translated(cached, provider: provider)
-        }
-        return nil
+        return cachedState(for: title)
+    }
+
+    /// What a row for this id would show now, without interning a box: the AppKit
+    /// table asks this for every row's height, including rows never displayed.
+    public func displayedState(for id: Article.ID, title: String) -> TitleState? {
+        liveState(for: id) ?? cachedState(for: title)
     }
 
     /// A row scrolled into view. After the dwell (if still requested), translate
@@ -218,8 +293,10 @@ public final class ListTitleTranslator {
         // Track visibility even while disabled, so enabling the feature can find
         // the rows already on screen and translate them at once.
         visibleTitles[id] = title
+        visibleCounts[id, default: 0] += 1
         guard enabled else { return }
-        scheduleTranslation(id: id, title: title, afterDwell: true)
+        let immediate = immediateUntil.map { ContinuousClock.now < $0 } ?? false
+        scheduleTranslation(id: id, title: title, afterDwell: !immediate)
     }
 
     /// Starts translating a visible row's title, unless it's already cached, the
@@ -254,6 +331,12 @@ public final class ListTitleTranslator {
     /// its partial discarded. The slot is freed by the task's own `finish` (not
     /// here), so the concurrency count stays correct even as it winds down.
     public func rowDisappeared(id: Article.ID) {
+        // Another row view for the same id is still on screen (a List rebuild).
+        if let count = visibleCounts[id], count > 1 {
+            visibleCounts[id] = count - 1
+            return
+        }
+        visibleCounts[id] = nil
         visibleTitles[id] = nil
         dwellTasks[id]?.cancel()
         dwellTasks[id] = nil
@@ -371,8 +454,9 @@ public final class ListTitleTranslator {
         // disappear) yet the row is on screen again — i.e. a real reappear gap.
         // Gating on `wasCancelled` avoids an infinite dwell→start→finish loop if the
         // translation API were to keep throwing without the task being cancelled.
-        if wasCancelled, let title = visibleTitles[id] {
-            rowAppeared(id: id, title: title)
+        // Not `rowAppeared`: the row is already counted as visible.
+        if wasCancelled, enabled, let title = visibleTitles[id] {
+            scheduleTranslation(id: id, title: title, afterDwell: true)
         }
     }
 
@@ -402,6 +486,7 @@ public final class ListTitleTranslator {
         // Also forget which rows are on screen, so cancelled tasks don't reschedule
         // and immediately rebuild the cache we just cleared.
         visibleTitles.removeAll()
+        visibleCounts.removeAll()
         cache.removeAll()
         cacheOrder.removeAll()
         sameLanguage.removeAll()
@@ -544,6 +629,11 @@ public final class ListTitleTranslator {
     /// Application Support/Nook/ListTitleTranslations.json — device-local, outside
     /// the sync folder, so it is never shared between devices.
     private nonisolated static func cacheURL() -> URL? {
+        #if DEBUG
+        // A perf run must neither read a real cache (every run would start warm)
+        // nor leave its fake translations behind.
+        if PerfLaunch.isActive { return nil }
+        #endif
         guard let base = try? FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
         ) else { return nil }

@@ -84,6 +84,13 @@ struct ContentView: View {
         #if DEBUG
         let _ = MainThreadLog.add("root.body", ms: 0)
         #endif
+        // Applied outside `workspace`: one more modifier on that chain is past
+        // what the type checker resolves in reasonable time.
+        workspace
+            .background { ReaderCommandActionsPublisher(store: store, isEnabled: composeSession == nil) }
+    }
+
+    private var workspace: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             FeedSidebar(
                 store: store,
@@ -145,35 +152,17 @@ struct ContentView: View {
                     .accessibilityIdentifier("plus-compose-button")
                 }
 
-                Button {
-                    store.toggleSelectedStarred()
-                } label: {
-                    Label(
-                        store.selectedArticle?.isStarred == true ? "Unstar" : "Star",
-                        systemImage: store.selectedArticle?.isStarred == true ? "star.fill" : "star"
-                    )
-                }
-                .disabled(store.selectedArticle == nil)
-                .help("Star Article")
+                // The root body must not read the selected article: every keyboard
+                // move would re-run it, and with it the sidebar and list columns.
+                // Leaf views own those reads and resolve missing IDs themselves.
+                SelectedStarToolbarButton(store: store)
+                    .help("Star Article")
 
-                Button {
-                    store.markSelectedRead()
-                } label: {
-                    Label("Mark Read", systemImage: "checkmark.circle")
-                }
-                .disabled(store.selectedArticle == nil)
-                .help("Mark Selected Article as Read")
+                SelectedMarkReadToolbarButton(store: store)
+                    .help("Mark Selected Article as Read")
 
-                if let article = store.selectedArticle {
-                    ArticleShareMenu(
-                        articleURL: article.url,
-                        title: article.title,
-                        markdown: { store.nativeReaderMarkdown(for: article) }
-                    ) { copied in
-                        Label("Share", systemImage: copied ? "checkmark" : "square.and.arrow.up")
-                    }
+                SelectedShareToolbarMenu(store: store)
                     .help("Share Article")
-                }
 
                 Button {
                     isInspectorPresented.toggle()
@@ -184,7 +173,7 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .principal) {
-                WindowBreadcrumb(store: store)
+                WindowBreadcrumbToolbarHost(store: store)
             }
         }
         .sheet(isPresented: $isAddingFeed) {
@@ -300,12 +289,7 @@ struct ContentView: View {
         .overlay { browserOverlay }
         .onChange(of: store.isBrowserPresented) { _, presented in
             if presented {
-                // Honor the selected article's feed preference, falling back to
-                // the global default (advancing articles re-resolves this in the
-                // store, so "next" follows the setting too).
-                if let article = store.selectedArticle {
-                    store.browserMode = store.resolvedBrowserMode(for: article)
-                }
+                resolvePresentedBrowserMode()
                 browserDragOffset = 0
             }
         }
@@ -316,56 +300,6 @@ struct ContentView: View {
                 Task { await plusStore.loadContent() }
             }
         }
-        .focusedSceneValue(\.readerCommandActions, composeSession == nil ? readerCommandActions : nil)
-    }
-
-    /// The menu-bar commands' bindings. Built here rather than inline in the
-    /// `.focusedSceneValue` call: the parser action is a closure that returns a
-    /// closure, and inside that already-long modifier chain the type checker gave up
-    /// on the whole `body`.
-    private var readerCommandActions: ReaderCommandActions {
-        let selected = store.selectedArticle
-        var switchParser: (@MainActor () -> Void)?
-        var refresh: (@MainActor () -> Void)?
-        var other: ReaderParserEngine?
-        // Offered only where a parser is actually running. With reader content off and
-        // no offline copy, the reader shows the feed's own body and nothing was parsed,
-        // so an enabled menu item would do nothing at all.
-        if let selected,
-           store.isBrowserPresented
-               || store.usesReaderContentByDefault
-               || store.isOfflineSaved(selected.id) {
-            let inBrowser = store.isBrowserPresented
-            other = inBrowser
-                ? store.browserParser(for: selected).other
-                : store.displayedReaderParser(for: selected).other
-            // Refresh replaces the *native* reader's body, so it is offered only
-            // where there is one to replace. The browser reloads by reopening.
-            if store.usesReaderContentByDefault || store.isOfflineSaved(selected.id) {
-                refresh = { [store] in store.refreshReaderContent(for: selected) }
-            }
-            switchParser = { [store] in
-                // The browser keeps its own copy of the page and re-renders from it, so
-                // aim at that surface while it is up rather than starting the native
-                // reader's re-extraction behind the sheet.
-                if store.isBrowserPresented {
-                    store.setBrowserParser(store.browserParser(for: selected).other, for: selected)
-                } else {
-                    store.setReaderParser(store.displayedReaderParser(for: selected).other, for: selected)
-                }
-            }
-        }
-        return ReaderCommandActions(
-            refreshAll: store.refreshAll,
-            markSelectedRead: store.markSelectedRead,
-            toggleSelectedStarred: store.toggleSelectedStarred,
-            selectNextArticle: store.selectNextArticle,
-            selectPreviousArticle: store.selectPreviousArticle,
-            toggleReaderMode: store.toggleBrowserMode,
-            switchArticleParser: switchParser,
-            otherArticleParser: other,
-            refreshArticle: refresh
-        )
     }
 
     /// Opens publishing directly from the main reader window. The retained Plus
@@ -392,10 +326,9 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
-            if store.isBrowserPresented, let article = store.selectedArticle {
-                InAppBrowserPanel(
+            if store.isBrowserPresented, store.hasSelectedArticle {
+                SelectedArticleBrowserPanel(
                     store: store,
-                    article: article,
                     style: readerStyle,
                     linkOpensInApp: readerLinkBehavior == .inApp,
                     dragOffset: $browserDragOffset,
@@ -419,6 +352,13 @@ struct ContentView: View {
 }
 
 private extension ContentView {
+    func resolvePresentedBrowserMode() {
+        // Resolve in the event handler, outside root body observation.
+        if let article = store.selectedArticle {
+            store.browserMode = store.resolvedBrowserMode(for: article)
+        }
+    }
+
     func closeBrowser() {
         withAnimation(.easeInOut(duration: 0.28)) {
             store.isBrowserPresented = false
@@ -505,6 +445,139 @@ private extension FileManager {
     }
 }
 
+/// Selection-dependent window chrome. Each reads the selected article in its own
+/// body so a selection change re-evaluates only these leaves, not `ContentView`.
+private struct SelectedStarToolbarButton: View {
+    let store: ReaderStore
+
+    var body: some View {
+        let isStarred = store.selectedArticle?.isStarred == true
+        Button {
+            store.toggleSelectedStarred()
+        } label: {
+            Label(isStarred ? "Unstar" : "Star", systemImage: isStarred ? "star.fill" : "star")
+        }
+        .disabled(store.selectedArticle == nil)
+    }
+}
+
+private struct SelectedMarkReadToolbarButton: View {
+    let store: ReaderStore
+
+    var body: some View {
+        Button {
+            store.markSelectedRead()
+        } label: {
+            Label("Mark Read", systemImage: "checkmark.circle")
+        }
+        .disabled(store.selectedArticle == nil)
+    }
+}
+
+private struct SelectedShareToolbarMenu: View {
+    let store: ReaderStore
+
+    /// Stands in while nothing is selected. The item stays in the toolbar, disabled
+    /// like Star and Mark Read: removing it when a switch cleared the selection made
+    /// SwiftUI rebuild the toolbar's items.
+    private static let placeholderURL = URL(string: "about:blank")!
+
+    var body: some View {
+        let article = store.selectedArticle
+        ArticleShareMenu(
+            articleURL: article?.url ?? Self.placeholderURL,
+            title: article?.title ?? "",
+            markdown: { article.map { store.nativeReaderMarkdown(for: $0) } ?? "" }
+        ) { copied in
+            Label("Share", systemImage: copied ? "checkmark" : "square.and.arrow.up")
+        }
+        .disabled(article == nil)
+    }
+}
+
+private struct SelectedArticleBrowserPanel: View {
+    let store: ReaderStore
+    let style: ReaderStyle
+    let linkOpensInApp: Bool
+    @Binding var dragOffset: CGFloat
+    let onClose: () -> Void
+
+    var body: some View {
+        if let article = store.selectedArticle {
+            InAppBrowserPanel(
+                store: store,
+                article: article,
+                style: style,
+                linkOpensInApp: linkOpensInApp,
+                dragOffset: $dragOffset,
+                onClose: onClose
+            )
+        }
+    }
+}
+
+/// Publishes the menu-bar commands' bindings from a leaf, because they capture the
+/// selected article and its parser state. Built here rather than inline in the
+/// `.focusedSceneValue` call: the parser action is a closure that returns a
+/// closure, and inside a long modifier chain the type checker gave up on `body`.
+private struct ReaderCommandActionsPublisher: View {
+    let store: ReaderStore
+    let isEnabled: Bool
+
+    var body: some View {
+        Color.clear
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .focusedSceneValue(\.readerCommandActions, isEnabled ? actions : nil)
+    }
+
+    private var actions: ReaderCommandActions {
+        let selected = store.selectedArticle
+        var switchParser: (@MainActor () -> Void)?
+        var refresh: (@MainActor () -> Void)?
+        var other: ReaderParserEngine?
+        // Offered only where a parser is actually running. With reader content off and
+        // no offline copy, the reader shows the feed's own body and nothing was parsed,
+        // so an enabled menu item would do nothing at all.
+        if let selected,
+           store.isBrowserPresented
+               || store.usesReaderContentByDefault
+               || store.isOfflineSaved(selected.id) {
+            let inBrowser = store.isBrowserPresented
+            other = inBrowser
+                ? store.browserParser(for: selected).other
+                : store.displayedReaderParser(for: selected).other
+            // Refresh replaces the *native* reader's body, so it is offered only
+            // where there is one to replace. The browser reloads by reopening.
+            if store.usesReaderContentByDefault || store.isOfflineSaved(selected.id) {
+                refresh = { [store] in store.refreshReaderContent(for: selected) }
+            }
+            switchParser = { [store] in
+                // The browser keeps its own copy of the page and re-renders from it, so
+                // aim at that surface while it is up rather than starting the native
+                // reader's re-extraction behind the sheet.
+                if store.isBrowserPresented {
+                    store.setBrowserParser(store.browserParser(for: selected).other, for: selected)
+                } else {
+                    store.setReaderParser(store.displayedReaderParser(for: selected).other, for: selected)
+                }
+            }
+        }
+        return ReaderCommandActions(
+            refreshAll: store.refreshAll,
+            markSelectedRead: store.markSelectedRead,
+            toggleSelectedStarred: store.toggleSelectedStarred,
+            selectNextArticle: store.selectNextArticle,
+            selectPreviousArticle: store.selectPreviousArticle,
+            toggleReaderMode: store.toggleBrowserMode,
+            switchArticleParser: switchParser,
+            otherArticleParser: other,
+            refreshArticle: refresh
+        )
+    }
+
+}
+
 private struct ReaderWorkspaceView: View {
     @Bindable var store: ReaderStore
     @Binding var isInspectorPresented: Bool
@@ -562,91 +635,12 @@ private struct FeedSidebar: View {
         #if DEBUG
         let _ = MainThreadLog.add("sidebar.body", ms: 0)
         #endif
+        // The sections sit directly in the List. Wrapping them in one equatable
+        // child view collapsed every section into a single row on macOS (only the
+        // headers showed), so selection highlights stay cheap through each row's
+        // `SidebarSelectionState` instead.
         List(selection: $store.feedSelection) {
-            Section("Library") {
-                ForEach(SmartSource.library) { source in
-                    smartSourceRow(source)
-                }
-            }
-
-            // The writer's publication is still an ordinary RSS feed. Keeping this
-            // as a dedicated way into that feed mirrors iOS while preserving all of
-            // the native reader's existing offline, search, and read-state behavior.
-            if let publication = URL(string: ownPublicationURL) {
-                Section {
-                    ownNookRow(publication: publication)
-                }
-            }
-
-            if !drafts.isEmpty {
-                Section("Drafts") {
-                    ForEach(drafts) { draft in
-                        draftRow(draft)
-                    }
-                }
-            }
-
-            if store.hasCategories {
-                Section("Categories") {
-                    ForEach(store.categories) { category in
-                        categorySourceRow(category)
-                    }
-                }
-            }
-
-            Section {
-                if store.feeds.isEmpty && store.feedFolders.isEmpty {
-                    Text(store.isStorageConfigured ? "Add an RSS or Atom feed." : "Choose a sync folder first.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(store.ungroupedFeeds) { feed in
-                        feedRow(feed)
-                    }
-
-                    ForEach(store.feedFolders, id: \.self) { folder in
-                        folderHeader(folder)
-
-                        if !collapsedFolders.contains(folder) {
-                            ForEach(store.feeds(inFolder: folder)) { feed in
-                                feedRow(feed)
-                                    .padding(.leading, 14)
-                            }
-                        }
-                    }
-                }
-            } header: {
-                HStack(spacing: 6) {
-                    if isTopLevelDropTargeted {
-                        Label("Move out of folder", systemImage: "tray.and.arrow.up")
-                            .foregroundStyle(Color.accentColor)
-                            .fontWeight(.semibold)
-                    } else {
-                        Text("Feeds")
-                    }
-                    Spacer()
-                }
-                .padding(.vertical, 3)
-                .padding(.horizontal, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.accentColor.opacity(isTopLevelDropTargeted ? 0.2 : 0))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(Color.accentColor, lineWidth: isTopLevelDropTargeted ? 1.5 : 0)
-                        )
-                )
-                .contentShape(Rectangle())
-                .dropDestination(for: String.self) { droppedIDs, _ in
-                    for id in droppedIDs { store.moveFeed(id, toFolder: "") }
-                    isTopLevelDropTargeted = false
-                    return true
-                } isTargeted: { targeted in
-                    withAnimation(.easeOut(duration: 0.1)) {
-                        isTopLevelDropTargeted = targeted
-                    }
-                }
-            }
+            sections
         }
         .listStyle(.sidebar)
         .navigationTitle("Feeds")
@@ -715,6 +709,94 @@ private struct FeedSidebar: View {
             Button("Cancel", role: .cancel) {}
         } message: { _ in
             Text("Enter a new name, or leave empty to use the feed's own name.")
+        }
+    }
+
+    @ViewBuilder
+    private var sections: some View {
+        Section("Library") {
+            ForEach(SmartSource.library) { source in
+                smartSourceRow(source)
+            }
+        }
+
+        // The writer's publication is still an ordinary RSS feed. Keeping this
+        // as a dedicated way into that feed mirrors iOS while preserving all of
+        // the native reader's existing offline, search, and read-state behavior.
+        if let publication = URL(string: ownPublicationURL) {
+            Section {
+                ownNookRow(publication: publication)
+            }
+        }
+
+        if !drafts.isEmpty {
+            Section("Drafts") {
+                ForEach(drafts) { draft in
+                    draftRow(draft)
+                }
+            }
+        }
+
+        if store.hasCategories {
+            Section("Categories") {
+                ForEach(store.categories) { category in
+                    categorySourceRow(category)
+                }
+            }
+        }
+
+        Section {
+            if store.feeds.isEmpty && store.feedFolders.isEmpty {
+                Text(store.isStorageConfigured ? "Add an RSS or Atom feed." : "Choose a sync folder first.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(store.ungroupedFeeds) { feed in
+                    feedRow(feed)
+                }
+
+                ForEach(store.feedFolders, id: \.self) { folder in
+                    folderHeader(folder)
+
+                    if !collapsedFolders.contains(folder) {
+                        ForEach(store.feeds(inFolder: folder)) { feed in
+                            feedRow(feed)
+                                .padding(.leading, 14)
+                        }
+                    }
+                }
+            }
+        } header: {
+            HStack(spacing: 6) {
+                if isTopLevelDropTargeted {
+                    Label("Move out of folder", systemImage: "tray.and.arrow.up")
+                        .foregroundStyle(Color.accentColor)
+                        .fontWeight(.semibold)
+                } else {
+                    Text("Feeds")
+                }
+                Spacer()
+            }
+            .padding(.vertical, 3)
+            .padding(.horizontal, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.accentColor.opacity(isTopLevelDropTargeted ? 0.2 : 0))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.accentColor, lineWidth: isTopLevelDropTargeted ? 1.5 : 0)
+                    )
+            )
+            .contentShape(Rectangle())
+            .dropDestination(for: String.self) { droppedIDs, _ in
+                for id in droppedIDs { store.moveFeed(id, toFolder: "") }
+                isTopLevelDropTargeted = false
+                return true
+            } isTargeted: { targeted in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    isTopLevelDropTargeted = targeted
+                }
+            }
         }
     }
 
@@ -897,75 +979,77 @@ private struct FeedSidebar: View {
         nonmutating set { collapsedFoldersData = (try? JSONEncoder().encode(newValue)) ?? Data() }
     }
 
-    @ViewBuilder
     private func folderHeader(_ folder: String) -> some View {
-        let isActive = store.isFolderSelected(folder)
         let isCollapsed = collapsedFolders.contains(folder)
-        let unread = store.unreadCount(inFolder: folder)
+        return SidebarSelectionState { store.isFolderSelected(folder) } content: { isActive in
+            let unread = store.unreadCount(inFolder: folder)
 
-        HStack(spacing: 4) {
-            Button {
-                withAnimation(.snappy(duration: 0.2)) {
-                    if isCollapsed { collapsedFolders.remove(folder) } else { collapsedFolders.insert(folder) }
-                }
-            } label: {
-                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                    .font(.caption2)
-                    .foregroundStyle(isActive ? Color.white.opacity(0.9) : Color.secondary)
-                    .frame(width: 12, height: 12)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Label(folder, systemImage: "folder")
-                .lineLimit(1)
-
-            Spacer(minLength: 8)
-
-            if unread > 0 {
-                Text(unread, format: .number)
-                    .font(.caption)
-                    .monospacedDigit()
-                    .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
-            }
-        }
-        .contentShape(Rectangle())
-        .foregroundStyle((isActive && dropTargetFolder != folder) ? Color.white : Color.primary)
-        .onTapGesture {
-            store.selectFolder(folder)
-        }
-        .listRowBackground(folderRowBackground(folder: folder, isActive: isActive))
-        .dropDestination(for: String.self) { droppedIDs, _ in
-            for id in droppedIDs { store.moveFeed(id, toFolder: folder) }
-            dropTargetFolder = nil
-            return true
-        } isTargeted: { targeted in
-            withAnimation(.easeOut(duration: 0.1)) {
-                if targeted {
-                    dropTargetFolder = folder
-                } else if dropTargetFolder == folder {
-                    dropTargetFolder = nil
-                }
-            }
-        }
-        .contextMenu {
-            Button {
-                renameFolderName = folder
-                folderPendingRename = folder
-            } label: {
-                Text("Rename Folder…")
-            }
-            Button(role: .destructive) {
-                folderPendingDeletion = folder
-            } label: {
-                Text("Remove Folder")
-            }
-            if store.feedFolders.count > 1 {
-                Divider()
+            HStack(spacing: 4) {
                 Button {
-                    isManagingFolders = true
+                    withAnimation(.snappy(duration: 0.2)) {
+                        if isCollapsed { collapsedFolders.remove(folder) } else { collapsedFolders.insert(folder) }
+                    }
                 } label: {
-                    Text("Delete Multiple Folders…")
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(isActive ? Color.white.opacity(0.9) : Color.secondary)
+                        .frame(width: 12, height: 12)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Label(folder, systemImage: "folder")
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                if unread > 0 {
+                    Text(unread, format: .number)
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
+                }
+            }
+            .contentShape(Rectangle())
+            .foregroundStyle((isActive && dropTargetFolder != folder) ? Color.white : Color.primary)
+            .onTapGesture {
+                store.selectFolder(folder)
+            }
+            .listRowBackground(folderRowBackground(folder: folder, isActive: isActive))
+            .dropDestination(for: String.self) { droppedIDs, _ in
+                for id in droppedIDs { store.moveFeed(id, toFolder: folder) }
+                dropTargetFolder = nil
+                return true
+            } isTargeted: { targeted in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    if targeted {
+                        dropTargetFolder = folder
+                    } else if dropTargetFolder == folder {
+                        dropTargetFolder = nil
+                    }
+                }
+            }
+            .contextMenu {
+                DeferredMenuContent {
+                    Button {
+                        renameFolderName = folder
+                        folderPendingRename = folder
+                    } label: {
+                        Text("Rename Folder…")
+                    }
+                    Button(role: .destructive) {
+                        folderPendingDeletion = folder
+                    } label: {
+                        Text("Remove Folder")
+                    }
+                    if store.feedFolders.count > 1 {
+                        Divider()
+                        Button {
+                            isManagingFolders = true
+                        } label: {
+                            Text("Delete Multiple Folders…")
+                        }
+                    }
                 }
             }
         }
@@ -1005,7 +1089,7 @@ private struct FeedSidebar: View {
         .tag(feed.id)
         .draggable(feed.id)
         .contextMenu {
-            feedContextMenu(feed)
+            DeferredMenuContent { feedContextMenu(feed) }
         }
     }
 
@@ -1014,34 +1098,35 @@ private struct FeedSidebar: View {
     @ViewBuilder
     private var downloadedSourceRow: some View {
         if store.hasOfflineArticles {
-            let isActive = store.feedSelection.isEmpty && store.smartSelection == .offline
             Divider()
-            Button {
-                store.selectSmartSource(.offline)
-            } label: {
-                HStack(spacing: 8) {
-                    Label(SmartSource.offline.title, systemImage: SmartSource.offline.systemImage)
-                        .font(.callout)
-                    Spacer(minLength: 8)
-                    let count = store.count(for: .offline)
-                    if count > 0 {
-                        Text(count, format: .number)
-                            .font(.caption)
-                            .monospacedDigit()
-                            .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
+            SidebarSelectionState { store.feedSelection.isEmpty && store.smartSelection == .offline } content: { isActive in
+                Button {
+                    store.selectSmartSource(.offline)
+                } label: {
+                    HStack(spacing: 8) {
+                        Label(SmartSource.offline.title, systemImage: SmartSource.offline.systemImage)
+                            .font(.callout)
+                        Spacer(minLength: 8)
+                        let count = store.count(for: .offline)
+                        if count > 0 {
+                            Text(count, format: .number)
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
+                        }
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                    .foregroundStyle(isActive ? Color.white : Color.secondary)
+                    .background(
+                        isActive
+                            ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 8)
+                            : nil
+                    )
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .contentShape(Rectangle())
-                .foregroundStyle(isActive ? Color.white : Color.secondary)
-                .background(
-                    isActive
-                        ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 8)
-                        : nil
-                )
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
     }
 
@@ -1051,16 +1136,47 @@ private struct FeedSidebar: View {
     @ViewBuilder
     private var filteredSourceRow: some View {
         if store.hasFilters {
-            let isActive = store.feedSelection.isEmpty && store.smartSelection == .filtered
             Divider()
+            SidebarSelectionState { store.feedSelection.isEmpty && store.smartSelection == .filtered } content: { isActive in
+                Button {
+                    store.selectSmartSource(.filtered)
+                } label: {
+                    HStack(spacing: 8) {
+                        Label(SmartSource.filtered.title, systemImage: SmartSource.filtered.systemImage)
+                            .font(.callout)
+                        Spacer(minLength: 8)
+                        let count = store.count(for: .filtered)
+                        if count > 0 {
+                            Text(count, format: .number)
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                    .foregroundStyle(isActive ? Color.white : Color.secondary)
+                    .background(
+                        isActive
+                            ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 8)
+                            : nil
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func smartSourceRow(_ source: SmartSource) -> some View {
+        SidebarSelectionState { store.feedSelection.isEmpty && store.smartSelection == source } content: { isActive in
             Button {
-                store.selectSmartSource(.filtered)
+                store.selectSmartSource(source)
             } label: {
                 HStack(spacing: 8) {
-                    Label(SmartSource.filtered.title, systemImage: SmartSource.filtered.systemImage)
-                        .font(.callout)
+                    Label(source.title, systemImage: source.systemImage)
                     Spacer(minLength: 8)
-                    let count = store.count(for: .filtered)
+                    let count = store.count(for: source)
                     if count > 0 {
                         Text(count, format: .number)
                             .font(.caption)
@@ -1068,78 +1184,48 @@ private struct FeedSidebar: View {
                             .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
                 .contentShape(Rectangle())
-                .foregroundStyle(isActive ? Color.white : Color.secondary)
-                .background(
-                    isActive
-                        ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 8)
-                        : nil
-                )
             }
             .buttonStyle(.plain)
+            .foregroundStyle(isActive ? Color.white : Color.primary)
+            .listRowBackground(
+                isActive
+                    ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 6)
+                    : nil
+            )
         }
     }
 
-    @ViewBuilder
-    private func smartSourceRow(_ source: SmartSource) -> some View {
-        let isActive = store.feedSelection.isEmpty && store.smartSelection == source
-        Button {
-            store.selectSmartSource(source)
-        } label: {
-            HStack(spacing: 8) {
-                Label(source.title, systemImage: source.systemImage)
-                Spacer(minLength: 8)
-                let count = store.count(for: source)
-                if count > 0 {
-                    Text(count, format: .number)
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(isActive ? Color.white : Color.primary)
-        .listRowBackground(
-            isActive
-                ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 6)
-                : nil
-        )
-    }
-
-    @ViewBuilder
     private func categorySourceRow(_ category: ArticleCategory) -> some View {
-        let isActive = store.feedSelection.isEmpty && store.categorySelection == category.id
-        Button {
-            store.selectCategory(category.id)
-        } label: {
-            HStack(spacing: 8) {
-                Label {
-                    Text(category.name.isEmpty ? String(localized: "Untitled") : category.name)
-                } icon: {
-                    Circle().fill(Color(nookHex: category.colorHex)).frame(width: 10, height: 10)
+        SidebarSelectionState { store.feedSelection.isEmpty && store.categorySelection == category.id } content: { isActive in
+            Button {
+                store.selectCategory(category.id)
+            } label: {
+                HStack(spacing: 8) {
+                    Label {
+                        Text(category.name.isEmpty ? String(localized: "Untitled") : category.name)
+                    } icon: {
+                        Circle().fill(Color(nookHex: category.colorHex)).frame(width: 10, height: 10)
+                    }
+                    Spacer(minLength: 8)
+                    let count = store.count(forCategory: category.id)
+                    if count > 0 {
+                        Text(count, format: .number)
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
+                    }
                 }
-                Spacer(minLength: 8)
-                let count = store.count(forCategory: category.id)
-                if count > 0 {
-                    Text(count, format: .number)
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(isActive ? Color.white.opacity(0.85) : Color.secondary)
-                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .foregroundStyle(isActive ? Color.white : Color.primary)
+            .listRowBackground(
+                isActive
+                    ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 6)
+                    : nil
+            )
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(isActive ? Color.white : Color.primary)
-        .listRowBackground(
-            isActive
-                ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor).padding(.horizontal, 6)
-                : nil
-        )
     }
 
     /// Acts on the whole feed selection when the right-clicked feed is part of
@@ -1225,6 +1311,31 @@ private struct FeedSidebar: View {
                 Text(title)
             }
         }
+    }
+}
+
+/// Evaluates a sidebar row's "is this the current source" in its own body.
+///
+/// The sidebar's body builds every feed row, so a selection read there re-ran all
+/// of them (and their menus) on every source switch. Reading it here confines that
+/// observation to the one row whose highlight it decides.
+private struct SidebarSelectionState<Content: View>: View {
+    let isActive: () -> Bool
+    @ViewBuilder let content: (Bool) -> Content
+
+    var body: some View {
+        content(isActive())
+    }
+}
+
+/// A context menu's items as a child view, built when the menu needs them rather
+/// than with the row (same reason as `ArticleRowMenu`): the feed menu sorts the
+/// folder list and reads the feed selection.
+private struct DeferredMenuContent<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
     }
 }
 
@@ -1634,6 +1745,51 @@ private struct PerfDisplayLinkProbe: NSViewRepresentable {
 }
 #endif
 
+/// Progress and empty-state observations stay outside the list's body.
+private struct ArticleListEmptyState: View {
+    let store: ReaderStore
+
+    var body: some View {
+        if store.activeSearchQuery.isEmpty, store.feedSelection.isEmpty, store.smartSelection == .unread {
+            ContentUnavailableView {
+                Label("You're All Caught Up", systemImage: "checkmark.circle")
+            } description: {
+                Text("No unread articles right now.")
+            } actions: {
+                Button("View All Articles") { store.selectSmartSource(.all) }
+                    .buttonStyle(.borderedProminent)
+            }
+        } else {
+            ContentUnavailableView {
+                Label("No Articles", systemImage: "newspaper")
+            } description: {
+                Text(store.activeSearchQuery.isEmpty ? "Add an RSS or Atom feed, then refresh." : "No article matches the current search.")
+            }
+        }
+    }
+}
+
+private struct ArticleListDownloadButton: View {
+    let store: ReaderStore
+    @Binding var showDownloadPicker: Bool
+
+    var body: some View {
+        if let progress = store.offlineDownloadProgress {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("\(progress.completed)/\(progress.total)").monospacedDigit()
+            }
+        } else if !store.visibleArticles.isEmpty {
+            Button {
+                showDownloadPicker = true
+            } label: {
+                Label("Download for Offline", systemImage: "arrow.down.circle")
+            }
+            .help("Choose articles in this list to save for offline reading")
+        }
+    }
+}
+
 private struct ArticleListView: View {
     @Bindable var store: ReaderStore
     @AppStorage(ReaderStore.translateListTitlesKey) private var translateListTitles = false
@@ -1658,64 +1814,12 @@ private struct ArticleListView: View {
                 } description: {
                     Text("Nook stores its RSS library in a folder you choose, so iCloud Drive can sync it like a vault.")
                 }
-            } else if store.visibleArticles.isEmpty {
-                if store.activeSearchQuery.isEmpty, store.feedSelection.isEmpty, store.smartSelection == .unread {
-                    ContentUnavailableView {
-                        Label("You're All Caught Up", systemImage: "checkmark.circle")
-                    } description: {
-                        Text("No unread articles right now.")
-                    } actions: {
-                        Button("View All Articles") { store.selectSmartSource(.all) }
-                            .buttonStyle(.borderedProminent)
-                    }
-                } else {
-                    ContentUnavailableView {
-                        Label("No Articles", systemImage: "newspaper")
-                    } description: {
-                        Text(store.activeSearchQuery.isEmpty ? "Add an RSS or Atom feed, then refresh." : "No article matches the current search.")
-                    }
-                }
+            } else if store.listWindow.totalCount == 0 {
+                ArticleListEmptyState(store: store)
+            } else if MacListBackend.current == .table {
+                ArticleTableRowsHost(store: store, titleTranslator: titleTranslator, translatesTitles: translateListTitles)
             } else {
-                List(selection: $store.selectedArticleID) {
-                    ForEach(store.visibleArticles) { article in
-                        #if DEBUG
-                        // The closure itself, which runs per row per pass whatever
-                        // SwiftUI decides about the row's body — the two feed and
-                        // translation lookups below are paid here, not there.
-                        let _ = MainThreadLog.add("list.rowcontent", ms: 0)
-                        #endif
-                        ArticleRow(article: article, feed: store.feed(for: article.feedID), translationBox: titleTranslator.box(for: article.id))
-                            .tag(article.id)
-                            .onAppear { titleTranslator.rowAppeared(id: article.id, title: article.title) }
-                            .onDisappear { titleTranslator.rowDisappeared(id: article.id) }
-                            // One view value each, not a tree each. Both closures are
-                            // re-run whenever this row's content is re-evaluated —
-                            // measured at 8,865 times in half a minute of scrolling,
-                            // against 650 evaluations of the row's own body — and
-                            // spelling the items out inline meant building ten views,
-                            // a nested category menu among them, every one of those
-                            // times, for a menu nobody had opened. A child view's
-                            // `body` is SwiftUI's to call when it actually needs the
-                            // items; the counters inside them say whether it does.
-                            .contextMenu { ArticleRowMenu(store: store, article: article) }
-                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                                ArticleRowSwipeActions(store: store, article: article)
-                            }
-                    }
-                }
-                .listStyle(.inset)
-                #if DEBUG
-                .background { PerfDisplayLinkProbe().accessibilityHidden(true) }
-                #endif
-                .onKeyPress(.return) {
-                    // Enter on the selected row opens the web view, mirroring a
-                    // click on the reader's title.
-                    guard store.selectedArticle != nil else { return .ignored }
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        store.isBrowserPresented = true
-                    }
-                    return .handled
-                }
+                ArticleListRows(store: store, titleTranslator: titleTranslator, translatesTitles: translateListTitles)
             }
         }
         // The source is shown by the toolbar breadcrumb instead, so no column
@@ -1723,19 +1827,7 @@ private struct ArticleListView: View {
         .searchable(text: $store.searchText, placement: .toolbar, prompt: "Search Articles")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                if let progress = store.offlineDownloadProgress {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("\(progress.completed)/\(progress.total)").monospacedDigit()
-                    }
-                } else if !store.visibleArticles.isEmpty {
-                    Button {
-                        showDownloadPicker = true
-                    } label: {
-                        Label("Download for Offline", systemImage: "arrow.down.circle")
-                    }
-                    .help("Choose articles in this list to save for offline reading")
-                }
+                ArticleListDownloadButton(store: store, showDownloadPicker: $showDownloadPicker)
             }
         }
         .sheet(isPresented: $showDownloadPicker) {
@@ -1745,18 +1837,15 @@ private struct ArticleListView: View {
         .safeAreaInset(edge: .bottom) {
             ArticleListStatusBar(store: store)
         }
-        .onChange(of: store.feedSelection) { _, _ in
-            store.clearRetainedArticles()
-            store.pruneSelectionIfHidden()
-        }
-        .onChange(of: store.smartSelection) { _, _ in
-            store.clearRetainedArticles()
-            store.pruneSelectionIfHidden()
-        }
         .onChange(of: store.searchText) { _, _ in
             store.debounceSearch()
         }
-        .onAppear { configureTitleTranslator() }
+        .onAppear {
+            configureTitleTranslator()
+            // A replacement rebuilds the List's identity, so no row holds a box
+            // past it; idle boxes go before the new rows intern theirs.
+            store.listWindow.onReplacement = { [titleTranslator] in titleTranslator.releaseIdleBoxes() }
+        }
         .onChange(of: translateListTitles) { _, _ in configureTitleTranslator() }
         .onChange(of: appLanguage) { _, _ in configureTitleTranslator() }
         .onChange(of: titleProvider) { _, _ in configureTitleTranslator() }
@@ -1792,90 +1881,277 @@ private struct ArticleListView: View {
     }
 }
 
+/// Captures the window before building the List. The row child receives a value,
+/// not an observation of live rows: replacing List identity cannot also update
+/// the old child with the new window. Binding-driven List passes keep equal child
+/// inputs, so selection changes do not re-evaluate the per-row closure.
+private struct ArticleListRows: View {
+    @Bindable var store: ReaderStore
+    let titleTranslator: ListTitleTranslator
+    let translatesTitles: Bool
+
+    var body: some View {
+        let rows = store.listWindow.rows
+        List(selection: $store.selectedArticleID) {
+            ArticleListRowContents(rows: rows, store: store, titleTranslator: titleTranslator,
+                                   translatesTitles: translatesTitles)
+        }
+        // Toggling title translation swaps every row between the plain and the
+        // translating layout. A fresh table measures them from scratch: a row
+        // whose cached translation appears with the swap is the case the native
+        // list keeps the old height for (see `synchronizeNativeListRowHeight`).
+        .id(ArticleListIdentity(generation: store.listGeneration, translatesTitles: translatesTitles))
+        .listStyle(.inset)
+        // Same contract as iOS: no new title translation starts mid-scroll (its
+        // reveal and streamed text re-measure rows), and settling drains the
+        // queue. A List replaced or removed mid-scroll never reports `.idle`.
+        .onScrollPhaseChange { _, phase in
+            #if DEBUG
+            MainThreadLog.add("list.scroll.phase", ms: 0)
+            #endif
+            titleTranslator.setScrolling(phase != .idle)
+        }
+        .onDisappear { titleTranslator.setScrolling(false) }
+        #if DEBUG
+        .background { PerfDisplayLinkProbe().accessibilityHidden(true) }
+        #endif
+        .onKeyPress(.return) {
+            guard store.selectedArticle != nil else { return .ignored }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                store.isBrowserPresented = true
+            }
+            return .handled
+        }
+    }
+}
+
+/// The AppKit table backend (`MacListBackend.table`). Reads the selection, so a
+/// selection change re-runs this small body and the table's `updateNSView`;
+/// rows reach the table through `ArticleListWindow.observer`, not through here.
+private struct ArticleTableRowsHost: View {
+    let store: ReaderStore
+    let titleTranslator: ListTitleTranslator
+    let translatesTitles: Bool
+
+    var body: some View {
+        ArticleTableRows(store: store, titleTranslator: titleTranslator, translatesTitles: translatesTitles,
+                         selectedID: store.selectedArticleID)
+            // Scrolls under the toolbar like the List; AppKit insets the content.
+            .ignoresSafeArea(.container, edges: .top)
+            #if DEBUG
+            .background { PerfDisplayLinkProbe().accessibilityHidden(true) }
+            #endif
+    }
+}
+
+private struct ArticleListIdentity: Hashable {
+    let generation: Int
+    let translatesTitles: Bool
+}
+
+private struct ArticleListRowContents: View {
+    let rows: [ArticleRowModel]
+    let store: ReaderStore
+    let titleTranslator: ListTitleTranslator
+    let translatesTitles: Bool
+
+    var body: some View {
+        #if DEBUG
+        let _ = MainThreadLog.add("list.rows.body", ms: 0)
+        #endif
+        ForEach(rows) { row in
+            #if DEBUG
+            // The closure itself, which runs per row per pass whatever
+            // SwiftUI decides about the row's body. It only wraps a value now:
+            // the feed, offline and translation lookups moved into the model or
+            // the row's own body.
+            let _ = MainThreadLog.add("list.rowcontent", ms: 0)
+            #endif
+            ArticleRow(model: row, titleTranslator: titleTranslator, translatesTitles: translatesTitles)
+                .equatable()
+                .tag(row.id)
+                // One appearance hook each: the translator tracks visible rows
+                // even while translation is off, so turning it on translates
+                // what is on screen.
+                .onAppear {
+                    titleTranslator.rowAppeared(id: row.id, title: row.title)
+                    store.listWindow.rowAppeared(id: row.id)
+                }
+                .onDisappear { titleTranslator.rowDisappeared(id: row.id) }
+                // One view value each, not a tree each. Both closures are
+                // re-run whenever this row's content is re-evaluated —
+                // measured at 8,865 times in half a minute of scrolling,
+                // against 650 evaluations of the row's own body — and
+                // spelling the items out inline meant building ten views,
+                // a nested category menu among them, every one of those
+                // times, for a menu nobody had opened. A child view's
+                // `body` is SwiftUI's to call when it actually needs the
+                // items; the counters inside them say whether it does.
+                .contextMenu { ArticleRowMenu(store: store, id: row.id) }
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    ArticleRowSwipeActions(store: store, id: row.id)
+                }
+        }
+    }
+}
+
 /// The row's context menu, as a view rather than a closure body.
 ///
 /// See the note at the call site: this exists so the list's per-row content stays a
-/// value, not ten views built on every pass over a thousand rows.
-private struct ArticleRowMenu: View {
+/// value, not ten views built on every pass over a thousand rows. It holds only
+/// the id and resolves the article when it is built, so its labels follow the
+/// current read/star state; an offline stand-in resolves from the displayed result.
+struct ArticleRowMenu: View {
     let store: ReaderStore
-    let article: Article
+    let id: Article.ID
 
     var body: some View {
         #if DEBUG
         let _ = MainThreadLog.add("list.row.menu", ms: 0)
         #endif
-        Button(article.isRead ? "Mark as Unread" : "Mark as Read") {
-            store.setRead(articleID: article.id, isRead: !article.isRead)
-        }
-        Button(article.isStarred ? "Remove Star" : "Star") {
-            store.toggleStarred(articleID: article.id)
-        }
-        Button(store.isOfflineSaved(article.id) ? "Remove Download" : "Save for Offline") {
-            if store.isOfflineSaved(article.id) {
-                store.removeOffline(article.id)
-            } else {
-                store.saveOffline(article)
+        if let article = store.listedArticle(withID: id) {
+            Button(article.isRead ? "Mark as Unread" : "Mark as Read") {
+                store.setRead(articleID: article.id, isRead: !article.isRead)
             }
+            Button(article.isStarred ? "Remove Star" : "Star") {
+                store.toggleStarred(articleID: article.id)
+            }
+            Button(store.isOfflineSaved(article.id) ? "Remove Download" : "Save for Offline") {
+                if store.isOfflineSaved(article.id) {
+                    store.removeOffline(article.id)
+                } else {
+                    store.saveOffline(article)
+                }
+            }
+            Menu("Categories") {
+                CategoryMenuItems(store: store, article: article)
+            }
+            Divider()
+            Link("Open in Browser", destination: article.url)
         }
-        Menu("Categories") {
-            CategoryMenuItems(store: store, article: article)
-        }
-        Divider()
-        Link("Open in Browser", destination: article.url)
     }
 }
 
 /// The row's leading swipe actions, for the same reason as `ArticleRowMenu`.
 private struct ArticleRowSwipeActions: View {
     let store: ReaderStore
-    let article: Article
+    let id: Article.ID
 
     var body: some View {
         #if DEBUG
         let _ = MainThreadLog.add("list.row.swipe", ms: 0)
         #endif
+        let article = store.listedArticle(withID: id)
+        let isRead = article?.isRead ?? false
+        let isStarred = article?.isStarred ?? false
         Button {
-            store.setRead(articleID: article.id, isRead: !article.isRead)
+            store.setRead(articleID: id, isRead: !isRead)
         } label: {
             Label(
-                article.isRead ? "Mark as Unread" : "Mark as Read",
-                systemImage: article.isRead ? "circle" : "checkmark.circle.fill"
+                isRead ? "Mark as Unread" : "Mark as Read",
+                systemImage: isRead ? "circle" : "checkmark.circle.fill"
             )
         }
         .tint(.accentColor)
 
         Button {
-            store.toggleStarred(articleID: article.id)
+            store.toggleStarred(articleID: id)
         } label: {
             Label(
-                article.isStarred ? "Remove Star" : "Star",
-                systemImage: article.isStarred ? "star.slash.fill" : "star.fill"
+                isStarred ? "Remove Star" : "Star",
+                systemImage: isStarred ? "star.slash.fill" : "star.fill"
             )
         }
         .tint(.yellow)
     }
 }
 
-private struct ArticleRow: View {
-    var article: Article
-    var feed: Feed?
-    let translationBox: ListTitleTranslator.StateBox
+/// One article-list row, drawn from its model alone.
+///
+/// Creating a row is what a source switch and a key-repeat scroll pay for every
+/// row that comes into view, so nothing here looks anything up that the model
+/// could have carried: the feed title and offline flag are in the model, the
+/// translation block exists only once there is a translation to show, and the
+/// category chips (resolved live, so a rename shows) are built only for a row
+/// that has categories. Equatable on the model: a pass over the list that hands
+/// a row the same model leaves its body alone.
+///
+/// With list-title translation off, the row is the plain layout: no translation
+/// box, slot, reveal preference or native row-height probe. The probe alone is an
+/// AppKit view inside every row's hosting view, and each of these is set up for
+/// every row that scrolls into view whether or not a title ever translates.
+private struct ArticleRow: View, Equatable {
+    let model: ArticleRowModel
+    let titleTranslator: ListTitleTranslator
+    let translatesTitles: Bool
+
+    nonisolated static func == (lhs: ArticleRow, rhs: ArticleRow) -> Bool {
+        lhs.model == rhs.model && lhs.titleTranslator === rhs.titleTranslator
+            && lhs.translatesTitles == rhs.translatesTitles
+    }
+
+    var body: some View {
+        #if DEBUG
+        // Counted, not logged: the article list is a thousand rows, and the
+        // question a stall raises is how many of them were re-evaluated, which a
+        // line each would answer unreadably.
+        let _ = MainThreadLog.add("list.row", ms: 0)
+        #endif
+        if translatesTitles {
+            TranslatingArticleRow(model: model, titleTranslator: titleTranslator)
+        } else {
+            ArticleRowLayout(model: model) { EmptyView() }
+        }
+    }
+}
+
+/// A row while list-title translation is on: the layout plus the title's
+/// translation slot, and the native row-height sync that the slot's reveal needs.
+private struct TranslatingArticleRow: View {
+    let model: ArticleRowModel
+    let titleTranslator: ListTitleTranslator
     /// Reveal progress of the translated-title block, used only to detect that
     /// the row height moved. Badges never move it — they live inline in the
     /// metadata line, so their arrival costs no height.
     @State private var rowRevealProgress: CGFloat = 0
+
+    var body: some View {
+        // Interned on the row's first body, never ahead of it for the whole
+        // window: rows that never come into view never get a box.
+        let translationBox = titleTranslator.box(for: model.id, title: model.title)
+        ArticleRowLayout(model: model) {
+            ListTitleTranslationSlot(
+                title: model.title,
+                box: translationBox,
+                translator: titleTranslator
+            )
+        }
+        .onPreferenceChange(
+            NativeListRowRevealProgressKey.self
+        ) { rowRevealProgress = $0 }
+        // Observe the per-title revision at the row root. macOS native lists can
+        // otherwise keep the height measured when a freshly inserted article had
+        // no translation block, even though the child view later grows correctly.
+        // (Categories no longer feed this: their line's height is reserved up
+        // front, so a badge arriving never changes the row height.)
+        .synchronizeNativeListRowHeight(
+            progress: rowRevealProgress,
+            layoutRevision: translationBox.layoutRevision
+        )
+    }
+}
+
+/// The row's content. `translation` sits under the title line, inside the
+/// zero-spacing title group.
+struct ArticleRowLayout<Translation: View>: View {
+    let model: ArticleRowModel
+    @ViewBuilder let translation: () -> Translation
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            #if DEBUG
-            // Counted, not logged: the article list is a thousand rows, and the
-            // question a stall raises is how many of them were re-evaluated, which a
-            // line each would answer unreadably.
-            let _ = MainThreadLog.add("list.row", ms: 0)
-            #endif
             Circle()
-                .fill(article.isRead ? Color.clear : Color.accentColor)
+                .fill(model.isRead ? Color.clear : Color.accentColor)
                 .frame(width: 8, height: 8)
                 .alignmentGuide(.firstTextBaseline) { dimension in
                     dimension[VerticalAlignment.center] + 3
@@ -1886,18 +2162,18 @@ private struct ArticleRow: View {
                 // collapsed (height-zero) block leaves no gap above the summary.
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(article.title)
-                            .fontWeight(article.isRead ? .regular : .semibold)
+                        Text(model.title)
+                            .fontWeight(model.isRead ? .regular : .semibold)
                             .lineLimit(2)
 
-                        if article.isStarred {
+                        if model.isStarred {
                             Image(systemName: "star.fill")
                                 .font(.caption)
                                 .foregroundStyle(.yellow)
                                 .accessibilityLabel("Starred")
                         }
 
-                        if OfflineArticleStore.shared.isSaved(article.id) {
+                        if model.isSavedOffline {
                             Image(systemName: "arrow.down.circle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -1905,13 +2181,10 @@ private struct ArticleRow: View {
                         }
                     }
 
-                    ListTitleTranslationBlock(
-                        title: article.title,
-                        box: translationBox
-                    )
+                    translation()
                 }
 
-                Text(article.summary)
+                Text(model.summary)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -1927,19 +2200,14 @@ private struct ArticleRow: View {
                 // swipe-action rendering from then on; a reserved badge line
                 // put a visible gap under every untagged row.)
                 HStack(spacing: 6) {
-                    Text(feed?.displayTitle ?? String(localized: "Unknown Feed"))
-                    Text("·")
-                    RelativeTimeText(article.publishedAt)
-                    Text("·")
-                    Text("\(article.estimatedReadMinutes) min")
+                    Text(model.feedDisplayTitle ?? ArticleRowStrings.unknownFeed)
+                    Text(verbatim: ArticleRowStrings.separator)
+                    RelativeTimeText(model.publishedAt)
+                    Text(verbatim: ArticleRowStrings.separator)
+                    Text(verbatim: ArticleRowStrings.readMinutes(model.readMinutes))
 
-                    let categories = ReaderStore.shared.categories(forArticle: article)
-                    if !categories.isEmpty {
-                        // Never compressed: a squeezed-to-nothing chip would
-                        // read as the tag silently missing. The feed title is
-                        // what truncates in a narrow column.
-                        CategoryBadges(categories)
-                            .fixedSize()
+                    if !model.categories.isEmpty {
+                        ArticleRowCategoryBadges(ids: model.categories)
                             .transition(.opacity)
                     }
                     Text(verbatim: "\u{200B}")
@@ -1954,25 +2222,53 @@ private struct ArticleRow: View {
                 .animation(
                     ReaderStore.shared.isBulkCategorizing || reduceMotion
                         ? nil : .smooth(duration: 0.28),
-                    value: article.categories
+                    value: model.categories
                 )
             }
         }
         .padding(.vertical, 8)
-        .onPreferenceChange(
-            NativeListRowRevealProgressKey.self
-        ) { rowRevealProgress = $0 }
-        // Observe the per-title revision at the row root. macOS native lists can
-        // otherwise keep the height measured when a freshly inserted article had
-        // no translation block, even though the child view later grows correctly.
-        // (Categories no longer feed this: their line's height is reserved up
-        // front, so a badge arriving never changes the row height.)
-        .synchronizeNativeListRowHeight(
-            progress: rowRevealProgress,
-            layoutRevision: translationBox.layoutRevision
-        )
     }
+}
 
+/// The metadata line's localized strings, resolved once instead of per row.
+///
+/// A `Text` built from a localized key resolves it against the environment's
+/// locale, and on macOS that lookup re-reads and re-parses the app's string table
+/// each time (`_copyStringTable` under `localizedAttributedStringForKey`). The
+/// row's three keys cost about 4 ms of every row entering view while scrolling,
+/// a sixth of the main thread's work in a constant scroll. The UI language only
+/// changes with a relaunch, so the resolved strings never go stale.
+@MainActor
+private enum ArticleRowStrings {
+    static let separator = String(localized: "·")
+    static let unknownFeed = String(localized: "Unknown Feed")
+    private static var minutes: [Int: String] = [:]
+
+    static func readMinutes(_ count: Int) -> String {
+        if let cached = minutes[count] { return cached }
+        let string = String(localized: "\(count) min", locale: AppLanguage.formattingLocale)
+        minutes[count] = string
+        return string
+    }
+}
+
+/// A row's category chips, resolved from the live definitions so a rename or
+/// recolor in Settings shows at once. Its own view so only tagged rows observe
+/// the category definitions.
+private struct ArticleRowCategoryBadges: View {
+    let ids: [String]
+
+    var body: some View {
+        let categories = ReaderStore.shared.categories(forIDs: ids)
+        if !categories.isEmpty {
+            // Never compressed: a squeezed-to-nothing chip would
+            // read as the tag silently missing. The feed title is
+            // what truncates in a narrow column.
+            CategoryBadges(categories)
+                .fixedSize()
+                .transition(.opacity)
+        }
+    }
 }
 
 private struct ArticleListStatusBar: View {
@@ -2032,6 +2328,38 @@ private struct ReaderTitleButtonStyle: ButtonStyle {
                 .animation(.easeOut(duration: 0.12), value: isHovering)
                 .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
         }
+    }
+}
+
+/// Hosts `WindowBreadcrumb` in its own `NSHostingView`, so the toolbar item's
+/// SwiftUI content never changes.
+///
+/// The breadcrumb names the selected article. Hosted inline, every selection change
+/// changed the principal item's content, and SwiftUI answered by rebuilding the
+/// toolbar's items (`ToolbarBridge.makeStorage`, `NSToolbarView` layout): 12.7% of
+/// main-thread samples during ↓ key repeat, and the toolbar share of a switch that
+/// clears the selection. The Star, Mark Read and Share items were not the trigger;
+/// making them constant changed nothing. In its own hosting view the breadcrumb
+/// observes the store itself and only its size reaches the toolbar.
+private struct WindowBreadcrumbToolbarHost: NSViewRepresentable {
+    let store: ReaderStore
+
+    func makeNSView(context: Context) -> NSHostingView<WindowBreadcrumb> {
+        let view = NSHostingView(rootView: WindowBreadcrumb(store: store))
+        view.sizingOptions = [.intrinsicContentSize]
+        view.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSHostingView<WindowBreadcrumb>, context: Context) {}
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize, nsView: NSHostingView<WindowBreadcrumb>, context: Context
+    ) -> CGSize? {
+        let ideal = nsView.intrinsicContentSize
+        let width = max(0, ideal.width == NSView.noIntrinsicMetric ? 0 : ideal.width)
+        return CGSize(width: proposal.width.map { min($0, width) } ?? width, height: max(0, ideal.height))
     }
 }
 
@@ -2456,17 +2784,15 @@ private struct ReaderDetailView: View {
     // Translation (Apple Intelligence). Rich (contentHTML) articles stream an
     // in-place translation preserving markup; plain-body articles fall back to a
     // whole-body translation.
-    @State private var nativeTranslator = NativeArticleTranslator()
-    @State private var detectedLanguage: String?
-    @State private var translatedTitle: String?
-    @State private var translatedBody: [String]?
-    @State private var isTranslated = false
-    @State private var isTranslating = false
-    @State private var isShowingTranslation = false
-    @State private var confirmingDelete = false
-    @State private var summaryController = ArticleSummaryController()
+    //
+    // The reader is updated in place across articles (see `readerPushID`), so this
+    // state outlives the article. The session keeps it tagged with its article and
+    // reads it only for that article: a new article's first body sees a clean
+    // reader, not the previous article's translation or summary.
+    @State private var session = ReaderArticleSession()
+    /// The article the delete confirmation was raised for.
+    @State private var pendingDeleteID: Article.ID?
     @State private var summaryRequestedArticleID: String?
-    @State private var summaryArticleID: String?
     @State private var summaryGenerationID = 0
 
     private var targetLanguage: Locale.Language {
@@ -2489,7 +2815,7 @@ private struct ReaderDetailView: View {
     /// to the system Translation overlay (so the button matches iOS and never
     /// silently disappears when Apple Intelligence is off/unsupported).
     private func canTranslate(_ article: Article) -> Bool {
-        guard let detected = detectedLanguage,
+        guard let detected = session.detectedLanguage(for: article.id),
               let target = targetLanguage.languageCode?.identifier else { return false }
         let detectedBase = Locale.Language(identifier: detected).languageCode?.identifier ?? detected
         return detectedBase != target
@@ -2520,65 +2846,55 @@ private struct ReaderDetailView: View {
     }
 
     private func translationActive(_ article: Article) -> Bool {
-        renderedReaderHTML(for: article) != nil ? nativeTranslator.isActive : isTranslated
-    }
-
-    private var translationBusy: Bool {
-        nativeTranslator.isTranslating || isTranslating
+        if renderedReaderHTML(for: article) != nil {
+            return session.translator(for: article.id)?.isActive ?? false
+        }
+        return session.plainTranslation(for: article.id) != nil
     }
 
     private func displayTitle(_ article: Article) -> String {
         if renderedReaderHTML(for: article) != nil {
-            return nativeTranslator.isActive ? (nativeTranslator.translatedTitle ?? article.title) : article.title
+            guard let translator = session.translator(for: article.id), translator.isActive else { return article.title }
+            return translator.translatedTitle ?? article.title
         }
-        return isTranslated ? (translatedTitle ?? article.title) : article.title
+        return session.plainTranslation(for: article.id)?.title ?? article.title
     }
 
     /// Toggles translation: rich articles stream in place; plain-body articles
     /// translate the whole body once. A length guard keeps an "answered"
     /// imperative title from replacing the real one.
     private func toggleTranslation(_ article: Article) {
+        session.begin(articleID: article.id)
         if let html = renderedReaderHTML(for: article) {
-            if nativeTranslator.isActive {
-                nativeTranslator.stop()
+            let translator = session.translator
+            if translator.isActive {
+                translator.stop()
             } else if NaturalTranslator.isAvailable(for: TranslationSettings.readerProvider()) {
-                nativeTranslator.start(html: html, baseURL: article.url, title: article.title, into: targetLanguageName)
+                translator.start(html: html, baseURL: article.url, title: article.title, into: targetLanguageName)
             } else {
-                isShowingTranslation = true
+                session.setShowingSystemTranslation(true, for: article.id)
             }
             return
         }
 
-        if isTranslated {
-            isTranslated = false
+        if session.plainTranslation(for: article.id) != nil {
+            session.setPlainTranslationShown(false, for: article.id)
             return
         }
-        if translatedBody != nil {
-            isTranslated = true
+        if session.hasPlainTranslation(for: article.id) {
+            session.setPlainTranslationShown(true, for: article.id)
             return
         }
         guard NaturalTranslator.isAvailable(for: TranslationSettings.readerProvider()) else {
-            isShowingTranslation = true
+            session.setShowingSystemTranslation(true, for: article.id)
             return
         }
-        isTranslating = true
-        let body = article.bodyParagraphs
-        let title = article.title
         let language = targetLanguageName
         let provider = TranslationSettings.readerProvider()
-        Task {
-            defer { isTranslating = false }
-            guard
-                let titleText = try? await NaturalTranslator.translate(title, into: language, provider: provider),
-                let bodyText = try? await NaturalTranslator.translate(body.joined(separator: "\n\n"), into: language, provider: provider)
-            else { return }
-            let cleanedTitle = titleText.trimmingCharacters(in: .whitespacesAndNewlines)
-            translatedTitle = cleanedTitle.count <= max(120, title.count * 4) ? cleanedTitle : title
-            translatedBody = bodyText
-                .components(separatedBy: "\n\n")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            isTranslated = true
+        // Tagged with the article inside the session: a result that returns after
+        // the reader moved to another article is dropped, not shown there.
+        session.translatePlainBody(articleID: article.id, title: article.title, paragraphs: article.bodyParagraphs) { text in
+            try await NaturalTranslator.translate(text, into: language, provider: provider)
         }
     }
 
@@ -2597,7 +2913,9 @@ private struct ReaderDetailView: View {
             } description: {
                 Text("Choose a folder in iCloud Drive and Nook keeps your feeds in sync across your devices.")
             }
-        } else if let article = store.selectedArticle {
+        } else if let article = store.readerArticle {
+            // The settled selection: held back only while the list selection is
+            // key-repeating, so the reader renders where the user stops.
             articleReader(article)
         } else {
             ContentUnavailableView {
@@ -2612,11 +2930,32 @@ private struct ReaderDetailView: View {
     /// transition direction so previous/next slide the natural way.
     @State private var readerNavForward = true
 
+    /// The reader's identity. It changes only for reader-pane previous/next, whose
+    /// push transition needs the old article to leave and the new one to arrive.
+    ///
+    /// Any other article change updates the reader in place. Keyed by the article,
+    /// every change built the whole reader again — its controls, menus, dialogs and
+    /// gestures — and that, not the article's text, was the cost: 108 ms a change on
+    /// a one-paragraph article (worst 114), 0 in place (readerTTFR 116 → 51). It was
+    /// the single long turn left in ↓ key repeat. The subviews that hold per-article
+    /// state (summary, `HTMLContentView`, comments) keep their own `.id(article.id)`,
+    /// and the scroll position is put back at the top explicitly. The reader's own
+    /// translation and summary state lives in `session`, which is read only for the
+    /// article it is bound to. The footer's Share menu keeps no id either: rebuilding
+    /// its pop-up button alone cost ~35 ms a change. It clears its "copied" checkmark
+    /// itself when the article's URL changes; its save sheet blocks the window while
+    /// it is open.
+    @State private var readerPushID = 0
+    @State private var readerScrollPosition = ScrollPosition(edge: .top)
+
     /// Navigates to the adjacent article with a directional push animation.
     private func navigateReader(forward: Bool) {
         readerNavForward = forward
         withAnimation(.easeInOut(duration: 0.3)) {
-            if forward { store.selectNextArticle() } else { store.selectPreviousArticle() }
+            readerPushID &+= 1
+            store.readerSelection.passingThrough {
+                if forward { store.selectNextArticle() } else { store.selectPreviousArticle() }
+            }
         }
     }
 
@@ -2626,25 +2965,31 @@ private struct ReaderDetailView: View {
                 articleHeader(article)
 
                 if summariesEnabled {
-                    if let summary = summaryController.summary {
-                        ArticleSummaryCard(
-                            summary: summary,
-                            style: summaryController.style,
-                            provider: summaryController.provider
-                        )
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    } else {
-                        ArticleSummaryActionButton(
-                            isLoading: summaryController.isLoading,
-                            issue: summaryController.issue
-                        ) {
-                            requestSummary(for: article)
+                    let summaryController = session.summary(for: article.id)
+                    Group {
+                        if let summaryController, let summary = summaryController.summary {
+                            ArticleSummaryCard(
+                                summary: summary,
+                                style: summaryController.style,
+                                provider: summaryController.provider
+                            )
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        } else {
+                            ArticleSummaryActionButton(
+                                isLoading: summaryController?.isLoading ?? false,
+                                issue: summaryController?.issue
+                            ) {
+                                requestSummary(for: article)
+                            }
                         }
                     }
+                    .id(article.id)
                 }
 
                 Divider()
 
+                // In-document anchors and their flash are per-document state, so
+                // each `HTMLContentView` carries the article's id itself.
                 readerBody(article)
 
                 // The page's own discussion, under the article it belongs to. Only
@@ -2654,7 +2999,8 @@ private struct ReaderDetailView: View {
                     Divider()
                     ReaderCommentsSection(
                         thread: comments, baseURL: article.url, typography: readerTypography,
-                        translator: nativeTranslator, translationLanguage: targetLanguageName)
+                        translator: session.translator(for: article.id), translationLanguage: targetLanguageName)
+                    .id(article.id)
                 }
 
                 Divider()
@@ -2668,7 +3014,7 @@ private struct ReaderDetailView: View {
                         articleURL: article.url,
                         title: article.title,
                         markdown: {
-                            nativeTranslator.translatedMarkdown
+                            session.translator(for: article.id)?.translatedMarkdown
                                 ?? store.nativeReaderMarkdown(for: article)
                         }
                     ) { copied in
@@ -2678,7 +3024,7 @@ private struct ReaderDetailView: View {
                     Spacer()
 
                     Button(role: .destructive) {
-                        confirmingDelete = true
+                        pendingDeleteID = article.id
                     } label: {
                         Label("Delete Article", systemImage: "trash")
                     }
@@ -2690,49 +3036,75 @@ private struct ReaderDetailView: View {
             .frame(maxWidth: 720, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
         }
+        .scrollPosition($readerScrollPosition)
+        .onChange(of: article.id, initial: true) { oldID, newID in
+            // Hand the per-article state to the new article. Its first body already
+            // read the session as empty; this clears what the old article left.
+            if session.begin(articleID: newID) {
+                summaryRequestedArticleID = nil
+            }
+            // The confirmation was for the article that just left.
+            pendingDeleteID = nil
+            // A new article opens at its top, as it did when each article was a new
+            // scroll view. Every `scrollTo` is a new request, unequal to the last
+            // even for the same edge, so this applies when the binding still reads
+            // `.top` from the previous article but an anchor jump moved the view.
+            if oldID != newID {
+                readerScrollPosition.scrollTo(edge: .top)
+            }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor))
         .confirmationDialog(
             "Delete this article?",
-            isPresented: $confirmingDelete,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Article", role: .destructive) { store.deleteArticle(articleID: article.id) }
+            isPresented: Binding(
+                get: { pendingDeleteID != nil },
+                set: { if !$0 { pendingDeleteID = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingDeleteID
+        ) { articleID in
+            // The article the dialog was raised for, not whichever is current now.
+            Button("Delete Article", role: .destructive) { store.deleteArticle(articleID: articleID) }
             Button("Cancel", role: .cancel) {}
-        } message: {
+        } message: { _ in
             Text("It's removed from your list on all your devices. This can't be undone.")
         }
         .overlay(alignment: .top) {
-            if translationBusy {
+            if session.isTranslating(for: article.id) {
                 TranslationBanner()
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: translationBusy)
-        .translationPresentation(isPresented: $isShowingTranslation, text: Self.translationText(for: article))
+        .animation(.easeInOut(duration: 0.2), value: SameArticleFlag(articleID: article.id, isOn: session.isTranslating(for: article.id)))
+        .translationPresentation(
+            isPresented: Binding(
+                get: { session.isShowingSystemTranslation(for: article.id) },
+                set: { session.setShowingSystemTranslation($0, for: article.id) }
+            ),
+            text: Self.translationText(for: article)
+        )
         .task(id: article.id) {
-            // Reset any prior translation and re-detect the language so the
-            // Translate action is offered only when it differs from the target.
-            nativeTranslator.stop()
-            isTranslated = false
-            translatedTitle = nil
-            translatedBody = nil
-            isShowingTranslation = false
-            detectedLanguage = nil
+            // The change handler has normally bound the article already; binding
+            // here too keeps the language detection below from being dropped.
+            if session.begin(articleID: article.id) {
+                summaryRequestedArticleID = nil
+            }
             // Start reader-mode extraction first so it isn't delayed behind
             // language detection.
             store.ensureReaderContent(for: article)
             // Detect the language off the main actor so the recognizer doesn't
             // run on the transition frame.
             let detected = await Task.detached { Self.detectLanguage(for: article) }.value
-            if !Task.isCancelled { detectedLanguage = detected }
+            // Re-detected per article so the Translate action is offered only when
+            // the language differs from the target.
+            if !Task.isCancelled { session.setDetectedLanguage(detected, for: article.id) }
             await markReadAfterDwell(article)
         }
         .task(id: summaryTaskKey(for: article)) {
-            if summaryArticleID != article.id {
-                summaryController.reset()
+            if session.begin(articleID: article.id) {
                 summaryRequestedArticleID = nil
-                summaryArticleID = article.id
             }
+            let summaryController = session.summary
             let manuallyRequested = summaryRequestedArticleID == article.id
             guard ArticleSummarySettings.shouldGenerate(
                 isEnabled: summariesEnabled,
@@ -2759,14 +3131,18 @@ private struct ReaderDetailView: View {
         // If reader-mode content finishes extracting AFTER translation was turned
         // on, restart the translator against the now-rendered extracted HTML so
         // its per-block overrides line up with what's shown.
-        .onChange(of: store.readerContentState(for: article)) { _, newValue in
-            guard nativeTranslator.isActive, case .ready(let extracted) = newValue else { return }
-            nativeTranslator.start(html: extracted, baseURL: article.url, title: article.title, into: targetLanguageName)
+        .onChange(of: ReaderContentChange(articleID: article.id, state: store.readerContentState(for: article))) { oldValue, newValue in
+            // Only this article's extraction finishing; a different article is a
+            // new reader, whose translation the article task has already reset.
+            guard oldValue.articleID == newValue.articleID else { return }
+            guard let translator = session.translator(for: article.id), translator.isActive,
+                  case .ready(let extracted) = newValue.state else { return }
+            translator.start(html: extracted, baseURL: article.url, title: article.title, into: targetLanguageName)
         }
         .onChange(of: summariesEnabled) { _, enabled in
             guard !enabled else { return }
             summaryRequestedArticleID = nil
-            summaryController.reset()
+            session.summary.reset()
         }
         // Pull past the bottom for the next article, past the top for the
         // previous one. The web reader keeps its own bottom-only affordance.
@@ -2784,9 +3160,29 @@ private struct ReaderDetailView: View {
                     .padding(.top, 10)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: store.isReparsing(article))
-        .id(article.id)
+        .animation(.easeInOut(duration: 0.2), value: SameArticleFlag(articleID: article.id, isOn: store.isReparsing(article)))
+        .id(readerPushID)
         .transition(.push(from: readerNavForward ? .bottom : .top))
+    }
+
+    /// The article's reader-content state, tagged with the article so a change of
+    /// article can be told apart from that article's extraction finishing.
+    private struct ReaderContentChange: Equatable {
+        let articleID: Article.ID
+        let state: ReaderStore.ReaderContentState?
+    }
+
+    /// An `.animation(_:value:)` value that changes only when the flag changes for
+    /// the same article. With the reader updated in place, opening another article
+    /// whose flag differs (one still re-parsing, say) must not animate the article
+    /// swap; before, the new article was a new view and nothing animated it.
+    private struct SameArticleFlag: Equatable {
+        let articleID: Article.ID
+        let isOn: Bool
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.articleID != rhs.articleID || lhs.isOn == rhs.isOn
+        }
     }
 
     /// Summaries consume exactly the Markdown represented by the visible native
@@ -2825,9 +3221,9 @@ private struct ReaderDetailView: View {
     }
 
     private func requestSummary(for article: Article) {
-        summaryController.reset()
-        summaryController.beginLoading()
-        summaryArticleID = article.id
+        session.begin(articleID: article.id)
+        session.summary.reset()
+        session.summary.beginLoading()
         summaryRequestedArticleID = article.id
         summaryGenerationID += 1
     }
@@ -2847,7 +3243,8 @@ private struct ReaderDetailView: View {
                             count: store.droppedEmbedCount(for: article),
                             onUseReadability: { store.setReaderParser(.readability, for: article) })
                     }
-                    HTMLContentView(html: html, baseURL: article.url, translator: nativeTranslator, typography: readerTypography)
+                    HTMLContentView(html: html, baseURL: article.url, translator: session.translator(for: article.id), typography: readerTypography)
+                        .id(article.id)
                 }
             case .gone:
                 VStack(alignment: .leading, spacing: 16) {
@@ -2888,10 +3285,11 @@ private struct ReaderDetailView: View {
     @ViewBuilder
     private func originalArticleBody(_ article: Article) -> some View {
         if let html = article.contentHTML {
-            HTMLContentView(html: html, baseURL: article.url, translator: nativeTranslator, typography: readerTypography)
-        } else if isTranslated, let translatedBody {
+            HTMLContentView(html: html, baseURL: article.url, translator: session.translator(for: article.id), typography: readerTypography)
+                .id(article.id)
+        } else if let translation = session.plainTranslation(for: article.id) {
             VStack(alignment: .leading, spacing: 16) {
-                ForEach(Array(translatedBody.enumerated()), id: \.offset) { _, paragraph in
+                ForEach(Array(translation.paragraphs.enumerated()), id: \.offset) { _, paragraph in
                     Text(paragraph)
                         .font(.system(size: readerTypography.bodySize, design: readerTypography.fontDesign))
                         .kerning(readerTypography.kern)
@@ -3062,7 +3460,7 @@ private struct ReaderDetailView: View {
                             systemImage: translationActive(article) ? "character.bubble.fill" : "character.bubble"
                         )
                     }
-                    .disabled(translationBusy)
+                    .disabled(session.isTranslating(for: article.id))
                 }
 
                 Menu {
