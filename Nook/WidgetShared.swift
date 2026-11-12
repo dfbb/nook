@@ -41,25 +41,26 @@ enum WidgetShared {
     /// The WidgetKit kind string for the Today News widget.
     static let todayNewsWidgetKind = "NookTodayNewsWidget"
 
-    /// The shared App Group `UserDefaults` suite, or `nil` when the entitlement
-    /// isn't active (e.g., unsigned debug builds — reads return an empty list
-    /// and writes are silently dropped).
-    static var appGroupDefaults: UserDefaults? {
-        UserDefaults(suiteName: appGroupID)
+    /// File-based cache shared between the main app and the widget extension via
+    /// a `temporary-exception.files.home-relative-path.read-write` entitlement.
+    /// Falls back gracefully (empty list / silent drop) when the path is inaccessible.
+    private static var cacheFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/nook-widget/today-news.json")
     }
 
-    /// Encodes `items` and stores them in the shared App Group defaults so the
-    /// widget extension can read them. A no-op when the App Group isn't available.
+    /// Encodes `items` and writes them to the shared cache file so the widget
+    /// extension can read them. A no-op when the file cannot be written.
     static func writeTodayNews(_ items: [TodayNewsItem]) {
-        guard let defaults = appGroupDefaults,
-              let data = try? JSONEncoder().encode(items) else { return }
-        defaults.set(data, forKey: todayNewsKey)
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        let dir = cacheFileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: cacheFileURL, options: .atomic)
     }
 
-    /// 读取缓存的今日新闻列表。App Group 不可用或尚未写入时返回空数组。
+    /// 读取缓存的今日新闻列表。缓存文件不存在或尚未写入时返回空数组。
     static func readTodayNews() -> [TodayNewsItem] {
-        guard let defaults = appGroupDefaults,
-              let data = defaults.data(forKey: todayNewsKey),
+        guard let data = try? Data(contentsOf: cacheFileURL),
               let items = try? JSONDecoder().decode([TodayNewsItem].self, from: data) else {
             return []
         }

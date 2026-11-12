@@ -6,5 +6,10 @@
 	<true/>
 <key>com.apple.security.network.client</key>
 	<true/>
+	<!-- Widget data cache written by the main app (no App Group required). -->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+	<array>
+		<string>Library/Application Support/nook-widget/</string>
+	</array>
 </dict>
 </plist>

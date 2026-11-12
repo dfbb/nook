@@ -5548,12 +5548,13 @@ public final class ReaderStore {
         // Encode and write via a detached task so the JSON work stays off the
         // main actor; WidgetCenter.reloadTimelines is then called back on main.
         Task.detached(priority: .utility) {
-            let appGroupID = "group.com.tim.nook"
-            let todayNewsKey = "widgetTodayNews"
             let todayNewsWidgetKind = "NookTodayNewsWidget"
-            guard let defaults = UserDefaults(suiteName: appGroupID),
-                  let data = try? JSONEncoder().encode(payload) else { return }
-            defaults.set(data, forKey: todayNewsKey)
+            guard let data = try? JSONEncoder().encode(payload) else { return }
+            let dir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/nook-widget")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let file = dir.appendingPathComponent("today-news.json")
+            try? data.write(to: file, options: .atomic)
             #if canImport(WidgetKit)
             await MainActor.run {
                 WidgetCenter.shared.reloadTimelines(ofKind: todayNewsWidgetKind)
